@@ -11,37 +11,55 @@ from mmd_metric import polynomial_mmd
 import argparse
 
 # Hinge Loss
-def loss_hinge_dis_real(dis_real):
-    loss_real = torch.mean(F.relu(1. - dis_real))
+def loss_hinge_dis_real(dis_real, wt_real=None):
+    if wt_real is None:
+        loss_real = torch.mean(F.relu(1. - dis_real))
+    else:
+        loss_real = torch.mean(F.relu(1. - dis_real) * wt_real.detach())
     return loss_real
 
 
-def loss_hinge_dis_fake(dis_fake):
-    loss_fake = torch.mean(F.relu(1. + dis_fake))
+def loss_hinge_dis_fake(dis_fake, wt_fake=None):
+    if wt_fake is None:
+        loss_fake = torch.mean(F.relu(1. + dis_fake))
+    else:
+        loss_fake = torch.mean(F.relu(1. + dis_fake) * wt_fake.detach())
     return loss_fake
 
 
-def loss_hinge_gen(dis_fake):
-    loss = -torch.mean(dis_fake)
+def loss_hinge_gen(dis_fake, wt_fake=None):
+    if wt_fake is None:
+        loss = -torch.mean(dis_fake)
+    else:
+        loss = -torch.mean(dis_fake * wt_fake.detach())
     return loss
 
 
 # Vanilla
-def loss_bce_dis_real(dis_output):
+def loss_bce_dis_real(dis_output, wt=None):
     target = torch.tensor(1.).cuda().expand_as(dis_output)
-    loss = F.binary_cross_entropy_with_logits(dis_output, target)
+    if wt is None:
+        loss = F.binary_cross_entropy_with_logits(dis_output, target)
+    else:
+        loss = F.binary_cross_entropy_with_logits(dis_output, target, weight=wt.detach())
     return loss
 
 
-def loss_bce_dis_fake(dis_output):
+def loss_bce_dis_fake(dis_output, wt=None):
     target = torch.tensor(0.).cuda().expand_as(dis_output)
-    loss = F.binary_cross_entropy_with_logits(dis_output, target)
+    if wt is None:
+        loss = F.binary_cross_entropy_with_logits(dis_output, target)
+    else:
+        loss = F.binary_cross_entropy_with_logits(dis_output, target, weight=wt.detach())
     return loss
 
 
-def loss_bce_gen(dis_fake):
+def loss_bce_gen(dis_fake, wt=None):
     target_real = torch.tensor(1.).cuda().expand_as(dis_fake)
-    loss = F.binary_cross_entropy_with_logits(dis_fake, target_real)
+    if wt is None:
+        loss = F.binary_cross_entropy_with_logits(dis_fake, target_real)
+    else:
+        loss = F.binary_cross_entropy_with_logits(dis_fake, target_real, weight=wt.detach())
     return loss
 
 
@@ -94,12 +112,12 @@ class G_guassian(nn.Module):
 
 class D_guassian(nn.Module):
 
-    def __init__(self, num_classes=3, AC=True, TAC=True, Proj=False,
-                 dis_mlp=False):
+    def __init__(self, num_classes=3, AC=True, TAC=True, Proj=False, dis_mlp=False, p2w=False):
         super(D_guassian, self).__init__()
         self.AC = AC
         self.TAC = TAC
         self.Proj = Proj
+        self.p2w = p2w
 
         self.encode = nn.Sequential(
             nn.Linear(1, 10),
@@ -121,11 +139,18 @@ class D_guassian(nn.Module):
             self.ac_linear = nn.Linear(10, num_classes)
         if self.TAC:
             self.tac_linear = nn.Linear(10, num_classes)
+        if self.p2w:
+            self.linear_w = nn.Linear(10, 1)
+            self.logvar_p = nn.Parameter(torch.tensor(0.))
+            self.logvar_q = nn.Parameter(torch.tensor(0.))
 
         if self.Proj:
             self.embed = nn.Embedding(num_embeddings=num_classes, embedding_dim=10)
 
         self.__initialize_weights()
+        if self.p2w:
+            self.linear_w.weight.data.fill_(0.)
+            self.linear_w.bias.data.fill_(0.)
 
     def forward(self, input, y=None):
         x = self.encode(input)
@@ -136,12 +161,15 @@ class D_guassian(nn.Module):
 
         ac = None
         tac = None
+        wt = None
         if self.AC:
             ac = self.ac_linear(x)
         if self.TAC:
             tac = self.tac_linear(x)
+        if self.p2w:
+            wt = torch.squeeze(self.linear_w(x.detach()))
 
-        return out, ac, tac
+        return out, ac, tac, wt
 
     def __initialize_weights(self):
         for m in self.modules():
@@ -152,7 +180,7 @@ class D_guassian(nn.Module):
                 m.bias.data.fill_(0)
 
 
-def train(data1, data2, data3, nz, G, D, optd, optg, loss_type='fc', gan_loss='bce'):
+def train(data1, data2, data3, nz, G, D, optd, optg, loss_type='fc', gan_loss='bce', weighted_loss=False):
     if gan_loss == 'hinge':
         loss_dis_real, loss_dis_fake, loss_gen = loss_hinge_dis_real, loss_hinge_dis_fake, loss_hinge_gen
     elif gan_loss == 'bce':
@@ -160,6 +188,7 @@ def train(data1, data2, data3, nz, G, D, optd, optg, loss_type='fc', gan_loss='b
     else:
         raise NotImplementedError
     bs = 384
+    lambda_type = 'amortised'
     for _ in range(20):
         for i in range(1000):
 
@@ -172,7 +201,7 @@ def train(data1, data2, data3, nz, G, D, optd, optg, loss_type='fc', gan_loss='b
                 label = torch.cat([torch.ones(128).cuda().long()*0, torch.ones(128).cuda().long()*1, torch.ones(128).cuda().long()*2], dim=0)
 
                 ###D on real
-                d_real, ac_real, tac_real = D(data, label)
+                d_real, ac_real, tac_real, logvar_real = D(data, label)
 
                 # prepare fake data
                 z = torch.randn(bs, nz).cuda()
@@ -180,22 +209,48 @@ def train(data1, data2, data3, nz, G, D, optd, optg, loss_type='fc', gan_loss='b
                 fake_data = G(z, label=fake_label)
 
                 ###D on fake
-                d_fake, ac_fake, tac_fake = D(fake_data, fake_label)
+                d_fake, ac_fake, tac_fake, logvar_fake = D(fake_data, fake_label)
+
+                if weighted_loss:
+                    if lambda_type == 'amortised':
+                        lambda_real = torch.sigmoid(logvar_real)
+                        lambda_fake = torch.sigmoid(logvar_fake)
+                    elif lambda_type == 'scalar':
+                        lambda_real = torch.sigmoid(D.logvar_p)
+                        lambda_fake = torch.sigmoid(D.logvar_q)
 
                 if loss_type == 'hybrid':
                     d_real = d_real + ac_real[range(bs), label] - tac_real[range(bs), label]
                     d_fake = d_fake + ac_fake[range(bs), fake_label] - tac_fake[range(bs), fake_label]
 
-                D_loss = loss_dis_real(d_real) + loss_dis_fake(d_fake)
+                if weighted_loss:
+                    D_loss = loss_dis_real(d_real, 1-lambda_real) + loss_dis_fake(d_fake, 1-lambda_fake)
+                else:
+                    D_loss = loss_dis_real(d_real) + loss_dis_fake(d_fake)
                 if loss_type in ['ac', 'tac', 'fc', 'hybrid']:
-                    D_loss += F.cross_entropy(ac_real, label)
+                    if weighted_loss:
+                        D_loss += torch.mean(F.cross_entropy(ac_real, label, reduction='none')*lambda_real.view(-1))
+                    else:
+                        D_loss += F.cross_entropy(ac_real, label)
                 if loss_type in ['ac', 'tac']:
                     D_loss += F.cross_entropy(ac_fake, fake_label)
                 if loss_type in ['tac', 'fc', 'hybrid']:
-                    D_loss += F.cross_entropy(tac_fake, fake_label)
+                    if weighted_loss:
+                        D_loss += torch.mean(F.cross_entropy(tac_fake, fake_label, reduction='none')*lambda_fake.view(-1))
+                    else:
+                        D_loss += F.cross_entropy(tac_fake, fake_label)
+                
+                if weighted_loss:
+                    #penalty = torch.mean(logvar_real) + torch.mean(logvar_fake)
+                    penalty = -(torch.mean(F.logsigmoid(logvar_real))+
+                        torch.mean(F.logsigmoid(-logvar_real))+
+                        torch.mean(F.logsigmoid(logvar_fake))+
+                        torch.mean(F.logsigmoid(-logvar_fake))) * 0.5
+                else:
+                    penalty = 0.
 
                 optd.zero_grad()
-                D_loss.backward()
+                (D_loss + penalty).backward()
                 optd.step()
 
             #####G step
@@ -203,12 +258,20 @@ def train(data1, data2, data3, nz, G, D, optd, optg, loss_type='fc', gan_loss='b
                 z = torch.randn(bs, nz).cuda()
                 fake_label = torch.LongTensor(bs).random_(3).cuda()
                 fake_data = G(z, label=fake_label)
-                d_fake, ac_fake, tac_fake = D(fake_data, fake_label)
+                d_fake, ac_fake, tac_fake, logvar_fake = D(fake_data, fake_label)
+                if weighted_loss:
+                    if lambda_type == 'amortised':
+                        lambda_fake = torch.sigmoid(logvar_fake)
+                    elif lambda_type == 'scalar':
+                        lambda_fake = torch.sigmoid(D.logvar_q)
 
                 # G_loss = F.binary_cross_entropy(d_fake, torch.ones(bs).cuda())
                 if loss_type == 'hybrid':
                     d_fake = d_fake + ac_fake[range(bs), fake_label] - tac_fake[range(bs), fake_label]
-                G_loss = loss_gen(d_fake)
+                if weighted_loss:
+                    G_loss = loss_gen(d_fake, 1-lambda_fake)
+                else:
+                    G_loss = loss_gen(d_fake)
 
                 if loss_type in ['ac', 'tac', 'fc']:
                     G_loss += F.cross_entropy(ac_fake, fake_label)
@@ -221,7 +284,7 @@ def train(data1, data2, data3, nz, G, D, optd, optg, loss_type='fc', gan_loss='b
 
 
 def get_start_id(args):
-    if args.resume:
+    if not args.resume:
         return 0
     else:
         cnt = 0
@@ -277,7 +340,7 @@ def evel_model(G, save_path, name, data1, data2, data3, r_data, distance):
     return (mean0_0, var0_0), (mean0_1, var0_1), (mean0_2, var0_2), (mean0, var0)
 
 
-def multi_results(distance, gan_loss='bce', dis_mlp=False, run_id=0, suffix='', no_graph=False):
+def multi_results(distance, gan_loss='bce', dis_mlp=False, run_id=0, suffix='', no_graph=False, models=[]):
     if not suffix and dis_mlp:
         suffix = '_mlp'
     # time.sleep(distance*3)
@@ -315,62 +378,78 @@ def multi_results(distance, gan_loss='bce', dis_mlp=False, run_id=0, suffix='', 
         # plt.title('Original')
         fig.savefig(save_path + '/original.eps')
 
-    ### fc, tac, ac, hy, proj
-    ## train fc
-    G = G_guassian(nz=nz, num_classes=3).cuda()
-    D = D_guassian(num_classes=3, AC=True, TAC=True, Proj=False).cuda()
-    optg = optim.Adam(G.parameters(), lr=0.002, betas=(0.5, 0.999))
-    optd = optim.Adam(D.parameters(), lr=0.002, betas=(0.5, 0.999))
-    train(data1, data2, data3, nz, G, D, optd, optg, loss_type='fc', gan_loss=gan_loss)
-    print('fc training done.')
-    res0_fc, res1_fc, res2_fc, resm_fc = evel_model(G, save_path, 'fc', data1, data2, data3, r_data, distance)
+    ### proj, tac, fc, p2, p2w
+    ## train proj
+    if 'proj' in models:
+        G = G_guassian(nz=nz, num_classes=3).cuda()
+        D = D_guassian(num_classes=3, AC=False, TAC=False, Proj=True).cuda()
+        optg = optim.Adam(G.parameters(), lr=0.002, betas=(0.5, 0.999))
+        optd = optim.Adam(D.parameters(), lr=0.002, betas=(0.5, 0.999))
+        train(data1, data2, data3, nz, G, D, optd, optg, loss_type='proj', gan_loss=gan_loss)
+        print('proj training done.')
+        res0_proj, res1_proj, res2_proj, resm_proj = evel_model(G, save_path, 'proj', data1, data2, data3, r_data, distance)
+    
+    ## train ac
+    if 'ac' in models:
+        G = G_guassian(nz=nz, num_classes=3).cuda()
+        D = D_guassian(num_classes=3, AC=True, TAC=False, Proj=False).cuda()
+        optg = optim.Adam(G.parameters(), lr=0.002, betas=(0.5, 0.999))
+        optd = optim.Adam(D.parameters(), lr=0.002, betas=(0.5, 0.999))
+        train(data1, data2, data3, nz, G, D, optd, optg, loss_type='ac', gan_loss=gan_loss)
+        print('ac training done.')
+        res0_ac, res1_ac, res2_ac, resm_ac = evel_model(G, save_path, 'ac', data1, data2, data3, r_data, distance)
 
     ## train tac
-    G = G_guassian(nz=nz, num_classes=3).cuda()
-    D = D_guassian(num_classes=3, AC=True, TAC=True, Proj=False).cuda()
-    optg = optim.Adam(G.parameters(), lr=0.002, betas=(0.5, 0.999))
-    optd = optim.Adam(D.parameters(), lr=0.002, betas=(0.5, 0.999))
-    train(data1, data2, data3, nz, G, D, optd, optg, loss_type='tac', gan_loss=gan_loss)
-    print('tac training done.')
-    res0_tac, res1_tac, res2_tac, resm_tac = evel_model(G, save_path, 'tac', data1, data2, data3, r_data, distance)
+    if 'tac' in models:
+        G = G_guassian(nz=nz, num_classes=3).cuda()
+        D = D_guassian(num_classes=3, AC=True, TAC=True, Proj=False).cuda()
+        optg = optim.Adam(G.parameters(), lr=0.002, betas=(0.5, 0.999))
+        optd = optim.Adam(D.parameters(), lr=0.002, betas=(0.5, 0.999))
+        train(data1, data2, data3, nz, G, D, optd, optg, loss_type='tac', gan_loss=gan_loss)
+        print('tac training done.')
+        res0_tac, res1_tac, res2_tac, resm_tac = evel_model(G, save_path, 'tac', data1, data2, data3, r_data, distance)
+    
+    ## train fc
+    if 'fc' in models:
+        G = G_guassian(nz=nz, num_classes=3).cuda()
+        D = D_guassian(num_classes=3, AC=True, TAC=True, Proj=False).cuda()
+        optg = optim.Adam(G.parameters(), lr=0.002, betas=(0.5, 0.999))
+        optd = optim.Adam(D.parameters(), lr=0.002, betas=(0.5, 0.999))
+        train(data1, data2, data3, nz, G, D, optd, optg, loss_type='fc', gan_loss=gan_loss)
+        print('fc training done.')
+        res0_fc, res1_fc, res2_fc, resm_fc = evel_model(G, save_path, 'fc', data1, data2, data3, r_data, distance)
 
-    ## train ac
-    G = G_guassian(nz=nz, num_classes=3).cuda()
-    D = D_guassian(num_classes=3, AC=True, TAC=False, Proj=False).cuda()
-    optg = optim.Adam(G.parameters(), lr=0.002, betas=(0.5, 0.999))
-    optd = optim.Adam(D.parameters(), lr=0.002, betas=(0.5, 0.999))
-    train(data1, data2, data3, nz, G, D, optd, optg, loss_type='ac', gan_loss=gan_loss)
-    print('ac training done.')
-    res0_ac, res1_ac, res2_ac, resm_ac = evel_model(G, save_path, 'ac', data1, data2, data3, r_data, distance)
+    ## train p2gan
+    if 'p2' in models:
+        G = G_guassian(nz=nz, num_classes=3).cuda()
+        D = D_guassian(num_classes=3, AC=True, TAC=True, Proj=False).cuda()
+        optg = optim.Adam(G.parameters(), lr=0.002, betas=(0.5, 0.999))
+        optd = optim.Adam(D.parameters(), lr=0.002, betas=(0.5, 0.999))
+        train(data1, data2, data3, nz, G, D, optd, optg, loss_type='hybrid', gan_loss=gan_loss)
+        print('p2gan training done.')
+        res0_hy, res1_hy, res2_hy, resm_hy = evel_model(G, save_path, 'p2', data1, data2, data3, r_data, distance)
 
-    ## train hybrid
-    G = G_guassian(nz=nz, num_classes=3).cuda()
-    D = D_guassian(num_classes=3, AC=True, TAC=True, Proj=False).cuda()
-    optg = optim.Adam(G.parameters(), lr=0.002, betas=(0.5, 0.999))
-    optd = optim.Adam(D.parameters(), lr=0.002, betas=(0.5, 0.999))
-    train(data1, data2, data3, nz, G, D, optd, optg, loss_type='hybrid', gan_loss=gan_loss)
-    print('hybrid training done.')
-    res0_hy, res1_hy, res2_hy, resm_hy = evel_model(G, save_path, 'hybrid', data1, data2, data3, r_data, distance)
-
-    ## train proj
-    G = G_guassian(nz=nz, num_classes=3).cuda()
-    D = D_guassian(num_classes=3, AC=False, TAC=False, Proj=True).cuda()
-    optg = optim.Adam(G.parameters(), lr=0.002, betas=(0.5, 0.999))
-    optd = optim.Adam(D.parameters(), lr=0.002, betas=(0.5, 0.999))
-    train(data1, data2, data3, nz, G, D, optd, optg, loss_type='projection', gan_loss=gan_loss)
-    print('fc training done.')
-    res0_proj, res1_proj, res2_proj, resm_proj = evel_model(G, save_path, 'projection', data1, data2, data3, r_data, distance)
+    ## train p2gan-w
+    if 'p2w' in models:
+        G = G_guassian(nz=nz, num_classes=3).cuda()
+        D = D_guassian(num_classes=3, AC=True, TAC=True, Proj=False, p2w=True).cuda()
+        optg = optim.Adam(G.parameters(), lr=0.002, betas=(0.5, 0.999))
+        optd = optim.Adam(D.parameters(), lr=0.002, betas=(0.5, 0.999))
+        train(data1, data2, data3, nz, G, D, optd, optg, loss_type='hybrid', gan_loss=gan_loss, weighted_loss=True)
+        print('p2gan-w training done.')
+        res0_hy, res1_hy, res2_hy, resm_hy = evel_model(G, save_path, 'p2w', data1, data2, data3, r_data, distance)
 
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser()
     parser.add_argument('--distance', type=float, help='distance for 1D MoG exp', default=4)
-    parser.add_argument('--num_runs', type=int, help='number of runs', default=1)
+    parser.add_argument('--num_runs', type=int, help='number of runs', default=100)
     parser.add_argument('--gan_loss', type=str, help='gan loss type', default='bce')
     parser.add_argument('--dis_mlp', action='store_true')
     parser.add_argument('--resume', action='store_true')
     parser.add_argument('--no_graph', action='store_true')
     parser.add_argument('--suffix', type=str, help='suffix', default='')
     args = parser.parse_args()
+    models = ['proj', 'tac', 'fc', 'p2', 'p2w']
     for i in range(get_start_id(args), args.num_runs):
-        multi_results(args.distance, args.gan_loss, args.dis_mlp, i, args.suffix, args.no_graph)
+        multi_results(args.distance, args.gan_loss, args.dis_mlp, i, args.suffix, args.no_graph, models)

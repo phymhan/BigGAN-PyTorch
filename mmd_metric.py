@@ -1,3 +1,6 @@
+"""
+copied from https://github.com/batmanlab/twin-auxiliary-classifiers-gan
+"""
 from __future__ import division, print_function
 
 import os.path, sys, tarfile
