@@ -20,15 +20,11 @@ import os
 def prepare_parser():
   usage = 'Calculate and store inception metrics.'
   parser = ArgumentParser(description=usage)
-  parser.add_argument('--inception_model', type=str, default='default')
   parser.add_argument('--use_custom_dataset', action='store_true')
   parser.add_argument('--image_size', type=int, default=64, help='only valid if use_custom_dataset')
   parser.add_argument('--num_classes', type=int, default=2, help='only valid if use_custom_dataset')
-  parser.add_argument('--index_filename', type=str, default='')
   parser.add_argument('--inception_moments_path', type=str, default='')
   parser.add_argument('--intra_inception_moments_path', type=str, default='')
-  parser.add_argument('--custom_inception_model_path', type=str, default='', help='if not empty, load custom inception model')
-  parser.add_argument('--custom_num_classes', type=int, default=2000, help='num classes')
   parser.add_argument(
     '--dataset', type=str, default='I128_hdf5',
     help='Which Dataset to train on, out of I128, I256, C10, C100...'
@@ -39,7 +35,7 @@ def prepare_parser():
   parser.add_argument(
     '--out_root', type=str, default='data')
   parser.add_argument(
-    '--batch_size', type=int, default=256,
+    '--batch_size', type=int, default=64,
     help='Default overall batchsize (default: %(default)s)')
   parser.add_argument(
     '--parallel', action='store_true', default=False,
@@ -62,44 +58,28 @@ def run(config):
   # Get loader
   config['drop_last'] = False
   loaders = utils.get_data_loaders(**config)
+  nclass = utils.nclass_dict.get(config['dataset'], config['num_classes'])
 
-  # Load inception net
-  if config['inception_model'] == 'default':
-    if config['custom_inception_model_path']:
-      print('loading custom inception model...')
-      net = inception_utils.load_custom_inception_net(parallel=config['parallel'],
-                                                      num_classes=config['custom_num_classes'],
-                                                      model_path=config['custom_inception_model_path'])
-    else:
-      net = inception_utils.load_inception_net(parallel=config['parallel'])
-  elif config['inception_model'] == 'studio':
-    net = inception_utils.load_studio_inception_net(parallel=config['parallel'])
-  pool, logits, labels = [], [], []
+  labels = []
   device = 'cuda'
+  total_num = 0
   for i, (x, y) in enumerate(tqdm(loaders[0])):
-    x = x.to(device)
-    with torch.no_grad():
-      pool_val, logits_val = net(x)
-      pool += [np.asarray(pool_val.cpu())]
-      logits += [np.asarray(F.softmax(logits_val, 1).cpu())]
-      labels += [np.asarray(y.cpu())]
+    labels += [np.asarray(y.cpu())]
+    total_num += y.size(0)
 
-  pool, logits, labels = [np.concatenate(item, 0) for item in [pool, logits, labels]]
+  labels = np.concatenate(labels, 0)
+
+  # histogram
+  count, _ = np.histogram(labels, nclass, [0, nclass])
+  prior = np.maximum(count / count.sum(), 1e-7)
+  log_prior = np.log(prior)
+
   # uncomment to save pool, logits, and labels to disk
-  # print('Saving pool, logits, and labels to disk...')
-  # np.savez(config['dataset']+'_inception_activations.npz',
-  #           {'pool': pool, 'logits': logits, 'labels': labels})
-  # Calculate inception metrics and report them
-  print('Calculating inception metrics...')
-  IS_mean, IS_std = inception_utils.calculate_inception_score(logits)
-  print('Training data from dataset %s has IS of %5.5f +/- %5.5f' % (config['dataset'], IS_mean, IS_std))
-  # Prepare mu and sigma, save to disk. Remove "hdf5" by default 
-  # (the FID code also knows to strip "hdf5")
-  print('Calculating means and covariances...')
-  mu, sigma = np.mean(pool, axis=0), np.cov(pool, rowvar=False)
-  print('Saving calculated means and covariances to disk...')
-  filepath = config['inception_moments_path'] or os.path.join(config['out_root'], config['dataset'].strip('_hdf5')+'_inception_moments.npz')
-  np.savez(filepath, **{'mu' : mu, 'sigma' : sigma})
+  np.savez(os.path.join(config['out_root'], config['dataset'].strip('_hdf5')+'_labels.npz'),
+           **{'labels': labels, 'prior': prior, 'log_prior': log_prior})
+  print(f'total number of images: {total_num}')
+  print(f'label distributions: {prior}')
+
 
 def main():
   # parse command line    
@@ -110,4 +90,4 @@ def main():
 
 
 if __name__ == '__main__':    
-    main()
+  main()

@@ -10,7 +10,7 @@ import torch.nn.functional as F
 from torch.nn import Parameter as P
 
 from sync_batchnorm import SynchronizedBatchNorm2d as SyncBN2d
-
+import pdb
 
 # Projection of x onto y
 def proj(x, y):

@@ -55,6 +55,24 @@ def make_dataset(dir, class_to_idx):
   return images
 
 
+def make_subset(dir, listdir, class_to_idx):
+  images = []
+  dir = os.path.expanduser(dir)
+  for target in tqdm(sorted(listdir)):
+    d = os.path.join(dir, target)
+    if not os.path.isdir(d):
+      continue
+
+    for root, _, fnames in sorted(os.walk(d)):
+      for fname in sorted(fnames):
+        if is_image_file(fname):
+          path = os.path.join(root, fname)
+          item = (path, class_to_idx[target])
+          images.append(item)
+
+  return images
+
+
 def pil_loader(path):
     # open path as file to avoid ResourceWarning (https://github.com/python-pillow/Pillow/issues/835)
   with open(path, 'rb') as f:
@@ -138,7 +156,6 @@ class ImageFolder(data.Dataset):
         path, target = imgs[index][0], imgs[index][1]
         self.data.append(self.transform(self.loader(path)))
         self.labels.append(target)
-          
 
   def __getitem__(self, index):
     """
@@ -175,7 +192,7 @@ class ImageFolder(data.Dataset):
     tmp = '    Target Transforms (if any): '
     fmt_str += '{0}{1}'.format(tmp, self.target_transform.__repr__().replace('\n', '\n' + ' ' * len(tmp)))
     return fmt_str
-        
+
 
 ''' ILSVRC_HDF5: A dataset to support I/O from an HDF5 to avoid
     having to load individual images all the time. '''
@@ -183,7 +200,7 @@ import h5py as h5
 import torch
 class ILSVRC_HDF5(data.Dataset):
   def __init__(self, root, transform=None, target_transform=None,
-               load_in_mem=False, train=True,download=False, validate_seed=0,
+               load_in_mem=False, train=True, download=False, validate_seed=0,
                val_split=0, **kwargs): # last four are dummies
       
     self.root = root

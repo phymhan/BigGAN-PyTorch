@@ -20,7 +20,11 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch.nn import Parameter as P
 from torchvision.models.inception import inception_v3
-
+import os
+import utils
+from lpips import LPIPS, calculate_lpips_given_images
+import pdb
+st = pdb.set_trace
 
 # Module that wraps the inception network to enable use with dataparallel and
 # returning pool features and logits.
@@ -128,10 +132,10 @@ def sqrt_newton_schulz(A, numIters, dtype=None):
     batchSize = A.shape[0]
     dim = A.shape[1]
     normA = A.mul(A).sum(dim=1).sum(dim=1).sqrt()
-    Y = A.div(normA.view(batchSize, 1, 1).expand_as(A));
+    Y = A.div(normA.view(batchSize, 1, 1).expand_as(A))
     I = torch.eye(dim,dim).view(1, dim, dim).repeat(batchSize,1,1).type(dtype)
     Z = torch.eye(dim,dim).view(1, dim, dim).repeat(batchSize,1,1).type(dtype)
-    for i in range(numIters):
+    for _ in range(numIters):
       T = 0.5*(3.0*I - Z.bmm(Y))
       Y = Y.bmm(T)
       Z = T.bmm(Z)
@@ -185,11 +189,11 @@ def numpy_calculate_frechet_distance(mu1, sigma1, mu2, sigma2, eps=1e-6):
 
   # Numerical error might give slight imaginary component
   if np.iscomplexobj(covmean):
-    print('wat')
+    # print('wat')  # suppress verbose
     if not np.allclose(np.diagonal(covmean).imag, 0, atol=1e-3):
       m = np.max(np.abs(covmean.imag))
       raise ValueError('Imaginary component {}'.format(m))
-    covmean = covmean.real  
+    covmean = covmean.real
 
   tr_covmean = np.trace(covmean) 
 
@@ -197,7 +201,7 @@ def numpy_calculate_frechet_distance(mu1, sigma1, mu2, sigma2, eps=1e-6):
   return out
 
 
-def torch_calculate_frechet_distance(mu1, sigma1, mu2, sigma2, eps=1e-6):
+def torch_calculate_frechet_distance(mu1, sigma1, mu2, sigma2, eps=1e-6, num_iters=50):
   """Pytorch implementation of the Frechet Distance.
   Taken from https://github.com/bioinf-jku/TTUR
   The Frechet distance between two multivariate Gaussians X_1 ~ N(mu_1, C_1)
@@ -216,8 +220,6 @@ def torch_calculate_frechet_distance(mu1, sigma1, mu2, sigma2, eps=1e-6):
   Returns:
   --   : The Frechet Distance.
   """
-
-
   assert mu1.shape == mu2.shape, \
     'Training and test mean vectors have different lengths'
   assert sigma1.shape == sigma2.shape, \
@@ -225,9 +227,8 @@ def torch_calculate_frechet_distance(mu1, sigma1, mu2, sigma2, eps=1e-6):
 
   diff = mu1 - mu2
   # Run 50 itrs of newton-schulz to get the matrix sqrt of sigma1 dot sigma2
-  covmean = sqrt_newton_schulz(sigma1.mm(sigma2).unsqueeze(0), 50).squeeze()  
-  out = (diff.dot(diff) +  torch.trace(sigma1) + torch.trace(sigma2)
-         - 2 * torch.trace(covmean))
+  covmean = sqrt_newton_schulz(sigma1.mm(sigma2).unsqueeze(0), numIters=num_iters).squeeze()
+  out = diff.dot(diff) +  torch.trace(sigma1) + torch.trace(sigma2) - 2*torch.trace(covmean)
   return out
 
 
@@ -245,21 +246,49 @@ def calculate_inception_score(pred, num_splits=10):
 # Loop and run the sampler and the net until it accumulates num_inception_images
 # activations. Return the pool, the logits, and the labels (if one wants 
 # Inception Accuracy the labels of the generated class will be needed)
-def accumulate_inception_activations(sample, net, num_inception_images=50000):
+def accumulate_inception_activations(sample, net, num_inception_images=50000, cls=None,
+                                     no_pool=False, no_logits=False, no_labels=False, use_drs=False):
   pool, logits, labels = [], [], []
-  while (torch.cat(logits, 0).shape[0] if len(logits) else 0) < num_inception_images:
+  num_accumulated = 0
+  while num_accumulated < num_inception_images:
     with torch.no_grad():
-      images, labels_val = sample()
+      images, labels_val = sample(y=cls, use_drs=use_drs)
+      if len(images) == 0:
+        continue
       pool_val, logits_val = net(images.float())
-      pool += [pool_val]
-      logits += [F.softmax(logits_val, 1)]
-      labels += [labels_val]
-  return torch.cat(pool, 0), torch.cat(logits, 0), torch.cat(labels, 0)
+      num_accumulated += pool_val.size(0)
+      if not no_pool:
+        pool += [pool_val]
+      if not no_logits:
+        logits += [F.softmax(logits_val, 1)]
+      if not no_labels:
+        labels += [labels_val]
+  pool = None if no_pool else torch.cat(pool, 0)
+  logits = None if no_logits else torch.cat(logits, 0)
+  labels = None if no_labels else torch.cat(labels, 0)
+  return pool, logits, labels
+
+
+def accumulate_images(sample, num_images=50000, cls=None, use_drs=False):
+  images = []
+  labels = []
+  num_accumulated = 0
+  while num_accumulated < num_images:
+    with torch.no_grad():
+      image_batch, label_batch = sample(y=cls, use_drs=use_drs)
+      if len(images) == 0:
+        continue
+      num_accumulated += image_batch.size(0)
+      images += [image_batch]
+      labels += [label_batch]
+  images = torch.cat(images, 0)
+  labels = torch.cat(labels, 0)
+  return images, labels
 
 
 # Load and wrap the Inception model
 def load_inception_net(parallel=False):
-  inception_model = inception_v3(pretrained=True, transform_input=False)
+  inception_model = inception_v3(pretrained=True, transform_input=False, init_weights=False)
   inception_model = WrapInception(inception_model.eval()).cuda()
   if parallel:
     print('Parallelizing Inception module...')
@@ -267,27 +296,128 @@ def load_inception_net(parallel=False):
   return inception_model
 
 
+def load_custom_inception_net(parallel=False, num_classes=1000, model_path='', model_type='default'):
+  if model_type == 'default':
+    inception_model = inception_v3_with_custom_num_classes(num_classes, False)
+    if model_path:
+      inception_model.load_state_dict(torch.load(model_path))
+    inception_model = WrapInception(inception_model.eval()).cuda()
+  elif model_type == 'studio':
+    from inception_network import InceptionV3
+    inception_model = InceptionV3(resize_input=True, normalize_input=False).eval().cuda()
+  else:
+    inception_model = None
+  if parallel:
+    print('Parallelizing Inception module...')
+    inception_model = nn.DataParallel(inception_model)
+  return inception_model
+
+
+def load_studio_inception_net(parallel=False, num_classes=1000, model_path='', model_type='studio'):
+  from inception_network import InceptionV3
+  inception_model = InceptionV3(resize_input=True, normalize_input=False).eval().cuda()
+  if parallel:
+    print('Parallelizing Inception module...')
+    inception_model = nn.DataParallel(inception_model)
+  return inception_model
+
+
+def inception_v3_with_custom_num_classes(num_classes=1000, init_weights=True):
+  def init_linear(m):
+    stddev = m.stddev if hasattr(m, 'stddev') else 0.1
+    # init as normal instead of truncated normal is much faster
+    # m.weight.data.normal_(0., stddev)
+    import scipy.stats as stats
+    X = stats.truncnorm(-2, 2, scale=stddev)
+    values = torch.as_tensor(X.rvs(m.weight.numel()), dtype=m.weight.dtype)
+    values = values.view(m.weight.size())
+    with torch.no_grad():
+      m.weight.copy_(values)
+
+  net = inception_v3(pretrained=True, transform_input=False, init_weights=False)
+  net.fc = nn.Linear(2048, num_classes)
+  net.AuxLogits.fc = nn.Linear(768, num_classes)
+  if init_weights:
+    init_linear(net.fc)
+    init_linear(net.AuxLogits.fc)
+  return net
+
+
 # This produces a function which takes in an iterator which returns a set number of samples
 # and iterates until it accumulates config['num_inception_images'] images.
 # The iterator can return samples with a different batch size than used in
 # training, using the setting confg['inception_batchsize']
-def prepare_inception_metrics(dataset, parallel, no_fid=False):
+def prepare_inception_metrics(dataset, data_root, parallel, no_fid=False, use_torch=True,
+                              no_intra_fid=False, intra_fid_classes=None, load_single_file=False,
+                              custom_inception_model_path='', custom_num_classes=1000,
+                              use_lpips=False, lpips_classes=None, config=None):
   # Load metrics; this is intentionally not in a try-except loop so that
   # the script will crash here if it cannot find the Inception moments.
   # By default, remove the "hdf5" from dataset
   dataset = dataset.strip('_hdf5')
-  data_mu = np.load(dataset+'_inception_moments.npz')['mu']
-  data_sigma = np.load(dataset+'_inception_moments.npz')['sigma']
+  # if os.path.exists(os.path.join(data_root, dataset+'_inception_moments.npz')):
+  #   inception_moments_path = os.path.join(data_root, dataset+'_inception_moments.npz')
+  # else:
+  #   inception_moments_path = config['inception_moments_path']
+  inception_moments_path = config['inception_moments_path'] or os.path.join(data_root, dataset+'_inception_moments.npz')
+  data_mu = np.load(inception_moments_path)['mu']
+  data_sigma = np.load(inception_moments_path)['sigma']
+  if (not no_intra_fid) and load_single_file:
+    if os.path.exists(os.path.join(data_root, dataset+'_intra_inception_moments.npz')):
+      intra_inception_moments_path = os.path.join(data_root, dataset+'_intra_inception_moments.npz')
+    else:
+      intra_inception_moments_path = config['intra_inception_moments_path']
+    data_intra_mu = np.load(intra_inception_moments_path)['mu']
+    data_intra_sigma = np.load(intra_inception_moments_path)['sigma']
+  else:
+    data_intra_mu, data_intra_sigma = None, None
+  n_classes = utils.nclass_dict.get(dataset, config['num_classes'])
+  # on which subset of classes do we evaluate intra-FID? evaluate on all classes if intra_fid_classes is empty (default)
+  if intra_fid_classes is None:
+    intra_fid_classes = range(n_classes)
+  if lpips_classes is None:
+    lpips_classes = range(n_classes)
   # Load network
-  net = load_inception_net(parallel)
-  def get_inception_metrics(sample, num_inception_images, num_splits=10, 
-                            prints=True, use_torch=True):
-    if prints:
-      print('Gathering activations...')
-    pool, logits, labels = accumulate_inception_activations(sample, net, num_inception_images)
-    if prints:  
-      print('Calculating Inception Score...')
-    IS_mean, IS_std = calculate_inception_score(logits.cpu().numpy(), num_splits)
+  if config['inception_model'] == 'default':
+    if custom_inception_model_path:
+      net = load_custom_inception_net(parallel, custom_num_classes, custom_inception_model_path)
+    else:
+      net = load_inception_net(parallel)
+  elif config['inception_model'] == 'studio':
+    net = load_studio_inception_net(parallel)
+  # Load AlexNet
+  if use_lpips:
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    lpips = LPIPS().eval().to(device)
+  else:
+    lpips = None
+
+  def get_inception_metrics(sample, num_inception_images, num_intra_inception_images,
+                            num_splits=10, prints=True, use_torch=use_torch,
+                            intra_fid_classes=intra_fid_classes, num_iters=50, use_torch_intra=False,
+                            use_lpips=False, lpips_classes=lpips_classes,
+                            which_metrics=['IS', 'FID', 'IntraFID', 'LPIPS'],
+                            use_drs=False, drs_classes=[]):
+    # drs_classes is only supported for classwise sampling
+    no_is = 'IS' not in which_metrics
+    no_fid = 'FID' not in which_metrics
+    no_intra_fid = 'IntraFID' not in which_metrics
+    no_lpips = 'LPIPS' not in which_metrics
+
+    # IS
+    if (not no_is) or (not no_fid):
+      if prints:
+        print('Gathering activations...')
+      pool, logits, labels = accumulate_inception_activations(sample, net, num_inception_images, cls=None,
+                                                              no_pool=no_fid, no_logits=False, no_labels=True)
+    if no_is:
+      IS_mean, IS_std = 0., 0.
+    else:
+      if prints:
+        print('Calculating Inception Score...')
+      IS_mean, IS_std = calculate_inception_score(logits.cpu().numpy(), num_splits)
+
+    # FID
     if no_fid:
       FID = 9999.0
     else:
@@ -298,13 +428,65 @@ def prepare_inception_metrics(dataset, parallel, no_fid=False):
       else:
         mu, sigma = np.mean(pool.cpu().numpy(), axis=0), np.cov(pool.cpu().numpy(), rowvar=False)
       if prints:
-        print('Covariances calculated, getting FID...')
+        which_backend = 'torch' if use_torch else 'numpy'
+        print(f'Covariances calculated, getting FID (using {which_backend})...')
       if use_torch:
-        FID = torch_calculate_frechet_distance(mu, sigma, torch.tensor(data_mu).float().cuda(), torch.tensor(data_sigma).float().cuda())
+        FID = torch_calculate_frechet_distance(mu, sigma, torch.tensor(data_mu).float().cuda(), torch.tensor(data_sigma).float().cuda(), num_iters=22)
         FID = float(FID.cpu().numpy())
       else:
-        FID = numpy_calculate_frechet_distance(mu.cpu().numpy(), sigma.cpu().numpy(), data_mu, data_sigma)
+        FID = numpy_calculate_frechet_distance(mu, sigma, data_mu, data_sigma)
     # Delete mu, sigma, pool, logits, and labels, just in case
-    del mu, sigma, pool, logits, labels
-    return IS_mean, IS_std, FID
+    if (not no_is) or (not no_fid):
+      del mu, sigma, pool, logits, labels
+
+    # Intra-FID
+    if no_intra_fid:
+      IntraFID = 9999.0 * np.ones(len(intra_fid_classes))
+    else:
+      IntraFID = []
+      if prints:
+        which_backend = 'torch' if use_torch_intra else 'numpy'
+        print(f'Gathering activations and calculating FID (using {which_backend}) for each class...')
+      for y in intra_fid_classes:
+        use_drs_for_this_class = use_drs and (y in drs_classes)
+        print(f'Intra-FID for class {y}, use_drs={use_drs_for_this_class}...')
+        pool, logits, labels = accumulate_inception_activations(sample, net, num_intra_inception_images, cls=y,
+                                                                no_pool=False, no_logits=True, no_labels=True,
+                                                                use_drs=use_drs_for_this_class)
+        # if os.path.exists(os.path.join(data_root, dataset+'_intra_inception_moments')):
+        #   intra_inception_moments_path = os.path.join(data_root, dataset+'_intra_inception_moments')
+        # else:
+        #   intra_inception_moments_path = config['intra_inception_moments_path']
+        intra_inception_moments_path = config['intra_inception_moments_path'] or os.path.join(data_root, dataset+'_intra_inception_moments')
+        data_mu_cls = data_intra_mu[y] if load_single_file else np.load(os.path.join(intra_inception_moments_path, f'{y:04d}.npz'))['mu']
+        data_sigma_cls = data_intra_sigma[y] if load_single_file else np.load(os.path.join(intra_inception_moments_path, f'{y:04d}.npz'))['sigma']
+        if use_torch_intra:
+          mu, sigma = torch.mean(pool, 0), torch_cov(pool, rowvar=False)
+          FID_cls = torch_calculate_frechet_distance(mu, sigma, torch.tensor(data_mu_cls).float().cuda(), torch.tensor(data_sigma_cls).float().cuda(), num_iters=22)
+          FID_cls = float(FID_cls.cpu().numpy())
+        else:
+          mu, sigma = np.mean(pool.cpu().numpy(), axis=0), np.cov(pool.cpu().numpy(), rowvar=False)
+          FID_cls = numpy_calculate_frechet_distance(mu, sigma, data_mu_cls, data_sigma_cls)
+          FID_cls = float(FID_cls)
+        IntraFID.append(FID_cls)
+        del mu, sigma, pool, logits, labels, data_mu_cls, data_sigma_cls
+      IntraFID = np.array(IntraFID)
+    
+    # LPIPS
+    if no_lpips:
+      lpips_vals = -1 * np.ones(len(lpips_classes))
+    else:
+      lpips_vals = []
+      if prints:
+        print(f'Gathering generated batches and calculating LPIPS for each class...')
+      for y in lpips_classes:
+        use_drs_for_this_class = use_drs and y in drs_classes
+        images, labels = accumulate_images(sample, num_intra_inception_images, cls=y,
+                                           use_drs=use_drs_for_this_class)
+        lpips_val = calculate_lpips_given_images(images, lpips)
+        lpips_vals.append(float(lpips_val))
+        del images, labels
+      lpips_vals = np.array(lpips_vals)
+
+    return IS_mean, IS_std, FID, IntraFID, lpips_vals
   return get_inception_metrics

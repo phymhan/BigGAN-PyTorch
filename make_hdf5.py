@@ -25,8 +25,13 @@ def prepare_parser():
     help='Which Dataset to train on, out of I128, I256, C10, C100;'
          'Append "_hdf5" to use the hdf5 version for ISLVRC (default: %(default)s)')
   parser.add_argument(
+    '--dataset_hdf5', type=str, default='ILSVRC', help='HDF5 file name')
+  parser.add_argument(
     '--data_root', type=str, default='data',
     help='Default location where data is stored (default: %(default)s)')
+  parser.add_argument(
+    '--out_root', type=str, default='data',
+  )
   parser.add_argument(
     '--batch_size', type=int, default=256,
     help='Default overall batchsize (default: %(default)s)')
@@ -48,7 +53,7 @@ def run(config):
                      'about to overwrite! Override this error only if you know '
                      'what you''re doing!')
   # Get image size
-  config['image_size'] = utils.imsize_dict[config['dataset']]
+  config['resolution'] = utils.imsize_dict.get(config['dataset'], config['image_size'])
 
   # Update compression entry
   config['compression'] = 'lzf' if config['compression'] else None #No compression; can also use 'lzf' 
@@ -81,10 +86,10 @@ def run(config):
     y = y.numpy()
     # If we're on the first batch, prepare the hdf5
     if i==0:
-      with h5.File(config['data_root'] + '/ILSVRC%i.hdf5' % config['image_size'], 'w') as f:
+      with h5.File(config['out_root'] + '/%s%i.hdf5' % (config['dataset_hdf5'], config['resolution']), 'w') as f:
         print('Producing dataset of len %d' % len(train_loader.dataset))
-        imgs_dset = f.create_dataset('imgs', x.shape,dtype='uint8', maxshape=(len(train_loader.dataset), 3, config['image_size'], config['image_size']),
-                                     chunks=(config['chunk_size'], 3, config['image_size'], config['image_size']), compression=config['compression']) 
+        imgs_dset = f.create_dataset('imgs', x.shape,dtype='uint8', maxshape=(len(train_loader.dataset), 3, config['resolution'], config['resolution']),
+                                     chunks=(config['chunk_size'], 3, config['resolution'], config['resolution']), compression=config['compression']) 
         print('Image chunks chosen as ' + str(imgs_dset.chunks))
         imgs_dset[...] = x
         labels_dset = f.create_dataset('labels', y.shape, dtype='int64', maxshape=(len(train_loader.dataset),), chunks=(config['chunk_size'],), compression=config['compression'])
@@ -92,7 +97,7 @@ def run(config):
         labels_dset[...] = y
     # Else append to the hdf5
     else:
-      with h5.File(config['data_root'] + '/ILSVRC%i.hdf5' % config['image_size'], 'a') as f:
+      with h5.File(config['out_root'] + '/%s%i.hdf5' % (config['dataset_hdf5'], config['resolution']), 'a') as f:
         f['imgs'].resize(f['imgs'].shape[0] + x.shape[0], axis=0)
         f['imgs'][-x.shape[0]:] = x
         f['labels'].resize(f['labels'].shape[0] + y.shape[0], axis=0)

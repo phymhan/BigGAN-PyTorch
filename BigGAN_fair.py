@@ -11,7 +11,7 @@ from torch.nn import Parameter as P
 
 import layers
 from sync_batchnorm import SynchronizedBatchNorm2d as SyncBatchNorm2d
-import pdb
+
 
 # Architectures for G
 # Attention is passed in in the format '32_64' to mean applying an attention
@@ -134,7 +134,7 @@ class Generator(nn.Module):
     self.which_embedding = nn.Embedding
     bn_linear = (functools.partial(self.which_linear, bias=False) if self.G_shared
                  else self.which_embedding)
-    self.which_bn = functools.partial(layers.ccbn,  # ccbn that is conditional
+    self.which_bn = functools.partial(layers.ccbn,
                           which_linear=bn_linear,
                           cross_replica=self.cross_replica,
                           mybn=self.mybn,
@@ -142,6 +142,7 @@ class Generator(nn.Module):
                                       else self.n_classes),
                           norm_style=self.norm_style,
                           eps=self.BN_eps)
+
 
     # Prepare model
     # If not using shared embeddings, self.shared is just a passthrough
@@ -312,6 +313,7 @@ class Discriminator(nn.Module):
     self.fp16 = D_fp16
     # Architecture
     self.arch = D_arch(self.ch, self.attention)[resolution]
+    self.output_dim_dict = {'jsd': n_classes, 'wgan': output_dim, 'gan': output_dim}
 
     # Which convs, batchnorms, and linear layers to use
     # No option to turn off SN in D right now
@@ -321,11 +323,11 @@ class Discriminator(nn.Module):
                           num_svs=num_D_SVs, num_itrs=num_D_SV_itrs,
                           eps=self.SN_eps)
       self.which_linear = functools.partial(layers.SNLinear,
-                            num_svs=num_D_SVs, num_itrs=num_D_SV_itrs,
-                            eps=self.SN_eps)
+                          num_svs=num_D_SVs, num_itrs=num_D_SV_itrs,
+                          eps=self.SN_eps)
       self.which_embedding = functools.partial(layers.SNEmbedding,
-                               num_svs=num_D_SVs, num_itrs=num_D_SV_itrs,
-                               eps=self.SN_eps)
+                              num_svs=num_D_SVs, num_itrs=num_D_SV_itrs,
+                              eps=self.SN_eps)
     # Prepare model
     # self.blocks is a doubly-nested list of modules, the outer loop intended
     # to be over blocks at a given resolution (resblocks and/or self-attention)
@@ -348,6 +350,8 @@ class Discriminator(nn.Module):
     # Linear output layer. The output dimension is typically 1, but may be
     # larger if we're e.g. turning this into a VAE with an inference output
     self.linear = self.which_linear(self.arch['out_channels'][-1], output_dim)
+    # Critic for W-dist between G(z,0) and G(z,1)
+    self.critic = self.which_linear(self.arch['out_channels'][-1], self.output_dim_dict[kwargs['fair_which_div']])
     # Embedding for projection discrimination
     self.embed = self.which_embedding(self.n_classes, self.arch['out_channels'][-1])
 
@@ -400,20 +404,8 @@ class Discriminator(nn.Module):
     out = self.linear(h)
     # Get projection of final featureset onto class vectors and add to evidence
     out = out + torch.sum(self.embed(y) * h, 1, keepdim=True)
-    return out
-  
-  def get_embedding(self, x, y=None):
-    # Get data embedding
-    h = x
-    # Loop over blocks
-    for index, blocklist in enumerate(self.blocks):
-      for block in blocklist:
-        h = block(h)
-    # Apply global sum pooling as in SN-GAN
-    h = torch.sum(self.activation(h), [2, 3])  # h is phi(x)
-    out = h
-    return out
-
+    out_f = self.critic(h)
+    return out, out_f
 
 # Parallelized G_D to minimize cross-gpu communication
 # Without this, Generator outputs would get all-gathered and then rebroadcast.
@@ -437,32 +429,28 @@ class G_D(nn.Module):
     # Split_D means to run D once with real data and once with fake,
     # rather than concatenating along the batch dimension.
     if split_D:
-      D_fake = self.D(G_z, gy)
+      D_fake, f_fake = self.D(G_z, gy)
       if x is not None:
-        D_real = self.D(x, dy)
-        return D_fake, D_real
+        D_real, f_real = self.D(x, dy)
+        f = torch.cat([f_fake, f_real], 0) if f_fake is not None else None
+        return D_fake, D_real, f
       else:
         if return_G_z:
-          return D_fake, G_z
+          return D_fake, G_z, f
         else:
-          return D_fake
+          return D_fake, f
     # If real data is provided, concatenate it with the Generator's output
     # along the batch dimension for improved efficiency.
     else:
       D_input = torch.cat([G_z, x], 0) if x is not None else G_z
       D_class = torch.cat([gy, dy], 0) if dy is not None else gy
       # Get Discriminator output
-      D_out = self.D(D_input, D_class)
+      D_out, f = self.D(D_input, D_class)
       if x is not None:
-        return torch.split(D_out, [G_z.shape[0], x.shape[0]]) # D_fake, D_real
+        D_fake, D_real = torch.split(D_out, [G_z.shape[0], x.shape[0]])
+        return D_fake, D_real, f
       else:
         if return_G_z:
-          return D_out, G_z
+          return D_out, G_z, f
         else:
-          return D_out
-  
-  def get_embedding(self, z, gy, x, dy):
-    G_z = self.G(z, self.G.shared(gy))
-    D_input = torch.cat([G_z, x], 0)
-    D_out = self.D.get_embedding(D_input)
-    return torch.split(D_out, [G_z.shape[0], x.shape[0]])
+          return D_out, f

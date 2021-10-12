@@ -39,8 +39,8 @@ def run(config):
         config[item] = state_dict['config'][item]
   
   # update config (see train.py for explanation)
-  config['resolution'] = utils.imsize_dict[config['dataset']]
-  config['n_classes'] = utils.nclass_dict[config['dataset']]
+  config['resolution'] = utils.imsize_dict.get(config['dataset'], config['image_size'])
+  config['n_classes'] = utils.nclass_dict.get(config['dataset'], config['num_classes'])
   config['G_activation'] = utils.activation_dict[config['G_nl']]
   config['D_activation'] = utils.activation_dict[config['D_nl']]
   config = utils.update_config_roots(config)
@@ -110,13 +110,14 @@ def run(config):
   # Prepare sample sheets
   if config['sample_sheets']:
     print('Preparing conditional sample sheets...')
-    utils.sample_sheet(G, classes_per_sheet=utils.classes_per_sheet_dict[config['dataset']], 
-                         num_classes=config['n_classes'], 
-                         samples_per_class=10, parallel=config['parallel'],
-                         samples_root=config['samples_root'], 
-                         experiment_name=experiment_name,
-                         folder_number=config['sample_sheet_folder_num'],
-                         z_=z_,)
+    utils.sample_sheet(G,
+                       classes_per_sheet=utils.classes_per_sheet_dict.get(config['dataset'], config['num_classes_per_sheet']), 
+                       num_classes=config['n_classes'], 
+                       samples_per_class=10, parallel=config['parallel'],
+                       samples_root=config['samples_root'], 
+                       experiment_name=experiment_name,
+                       folder_number=config['sample_sheet_folder_num'],
+                       z_=z_,)
   # Sample interp sheets
   if config['sample_interps']:
     print('Preparing interp sheets...')
@@ -139,11 +140,25 @@ def run(config):
                                  normalize=True)
 
   # Get Inception Score and FID
-  get_inception_metrics = inception_utils.prepare_inception_metrics(config['dataset'], config['parallel'], config['no_fid'])
+  intra_fid_classes = utils.str2list(config['intra_fid_classes']) if config['intra_fid_classes'] else list(range(config['n_classes']))
+  print(f'Intra-FID will be calculated for classes {intra_fid_classes} (for all classes if empty).')
+  lpips_classes = utils.str2list(config['lpips_classes']) if config['lpips_classes'] else list(range(config['n_classes']))
+  print(f'LPIPS will be calculated for classes {lpips_classes} (for all classes if empty).')
+  get_inception_metrics = inception_utils.prepare_inception_metrics(config['dataset'], config['data_root'], config['parallel'],
+                                                                    config['no_fid'], config['use_torch'],
+                                                                    config['no_intra_fid'], intra_fid_classes, config['load_single_inception_moments'],
+                                                                    custom_inception_model_path=config['custom_inception_model_path'],
+                                                                    custom_num_classes=config['custom_num_classes'],
+                                                                    use_lpips=config['use_lpips'], lpips_classes=lpips_classes, config=config)
   # Prepare a simple function get metrics that we use for trunc curves
   def get_metrics():
-    sample = functools.partial(utils.sample, G=G, z_=z_, y_=y_, config=config)    
-    IS_mean, IS_std, FID = get_inception_metrics(sample, config['num_inception_images'], num_splits=10, prints=False)
+    sample = functools.partial(utils.sample, G=G, z_=z_, y_=y_, config=config)
+    IS_mean, IS_std, FID, IntraFID, LPIPS = get_inception_metrics(sample, 
+                                            config['num_inception_images'],
+                                            config['num_intra_inception_images'],
+                                            num_splits=10, num_iters=config['torch_fid_num_iters'],
+                                            use_torch_intra=config['use_torch_intra'],
+                                            use_lpips=config['use_lpips'], prints=False)
     # Prepare output string
     outstring = 'Using %s weights ' % ('ema' if config['use_ema'] else 'non-ema')
     outstring += 'in %s mode, ' % ('eval' if config['G_eval_mode'] else 'training')

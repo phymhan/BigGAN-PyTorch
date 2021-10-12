@@ -27,6 +27,7 @@ def prepare_parser():
   parser.add_argument('--index_filename', type=str, default='')
   parser.add_argument('--inception_moments_path', type=str, default='')
   parser.add_argument('--intra_inception_moments_path', type=str, default='')
+  parser.add_argument('--load_single_inception_moments', action='store_true', help='load single file for mu and sigma?')
   parser.add_argument('--custom_inception_model_path', type=str, default='', help='if not empty, load custom inception model')
   parser.add_argument('--custom_num_classes', type=int, default=2000, help='num classes')
   parser.add_argument(
@@ -39,7 +40,7 @@ def prepare_parser():
   parser.add_argument(
     '--out_root', type=str, default='data')
   parser.add_argument(
-    '--batch_size', type=int, default=256,
+    '--batch_size', type=int, default=64,
     help='Default overall batchsize (default: %(default)s)')
   parser.add_argument(
     '--parallel', action='store_true', default=False,
@@ -62,6 +63,7 @@ def run(config):
   # Get loader
   config['drop_last'] = False
   loaders = utils.get_data_loaders(**config)
+  n_classes = utils.nclass_dict.get(config['dataset'], config['num_classes'])
 
   # Load inception net
   if config['inception_model'] == 'default':
@@ -74,32 +76,39 @@ def run(config):
       net = inception_utils.load_inception_net(parallel=config['parallel'])
   elif config['inception_model'] == 'studio':
     net = inception_utils.load_studio_inception_net(parallel=config['parallel'])
-  pool, logits, labels = [], [], []
+  pool, logits, labels = [[] for _ in range(n_classes)], [[] for _ in range(n_classes)], [[] for _ in range(n_classes)]
   device = 'cuda'
   for i, (x, y) in enumerate(tqdm(loaders[0])):
     x = x.to(device)
     with torch.no_grad():
       pool_val, logits_val = net(x)
-      pool += [np.asarray(pool_val.cpu())]
-      logits += [np.asarray(F.softmax(logits_val, 1).cpu())]
-      labels += [np.asarray(y.cpu())]
+      for j in range(y.size(0)):
+        pool[y[j]] += [np.asarray(pool_val[j:j+1,...].cpu())]
+        # logits[y[j]] += [np.asarray(F.softmax(logits_val[j:j+1,...], 1).cpu())]
+        # labels[y[j]] += [np.asarray(y[j:j+1,...].cpu())]
+  pool = [np.concatenate(item, 0) for item in pool]
+  # logits = [np.concatenate(item, 0) for item in logits]
+  # labels = [np.concatenate(item, 0) for item in labels]
 
-  pool, logits, labels = [np.concatenate(item, 0) for item in [pool, logits, labels]]
-  # uncomment to save pool, logits, and labels to disk
-  # print('Saving pool, logits, and labels to disk...')
-  # np.savez(config['dataset']+'_inception_activations.npz',
-  #           {'pool': pool, 'logits': logits, 'labels': labels})
-  # Calculate inception metrics and report them
-  print('Calculating inception metrics...')
-  IS_mean, IS_std = inception_utils.calculate_inception_score(logits)
-  print('Training data from dataset %s has IS of %5.5f +/- %5.5f' % (config['dataset'], IS_mean, IS_std))
   # Prepare mu and sigma, save to disk. Remove "hdf5" by default 
   # (the FID code also knows to strip "hdf5")
   print('Calculating means and covariances...')
-  mu, sigma = np.mean(pool, axis=0), np.cov(pool, rowvar=False)
-  print('Saving calculated means and covariances to disk...')
-  filepath = config['inception_moments_path'] or os.path.join(config['out_root'], config['dataset'].strip('_hdf5')+'_inception_moments.npz')
-  np.savez(filepath, **{'mu' : mu, 'sigma' : sigma})
+  mu = [0 for _ in range(n_classes)]
+  sigma = [0 for _ in range(n_classes)]
+  tar_path = config['intra_inception_moments_path'] or os.path.join(config['out_root'], config['dataset'].strip('_hdf5')+'_intra_inception_moments')
+  if not os.path.exists(tar_path):
+    os.mkdir(tar_path)
+  for y in range(n_classes):
+    mu_, sigma_ = np.mean(pool[y], axis=0), np.cov(pool[y], rowvar=False)
+    if config['load_single_inception_moments']:
+      mu[y], sigma[y] = mu_, sigma_
+    else:
+      np.savez(os.path.join(tar_path, f'{y:04d}.npz'), **{'mu': mu_, 'sigma': sigma_})
+      print(f'moments for class {y} saved to {tar_path}/{y:04d}.npz')
+  if config['load_single_inception_moments']:
+    print('Saving calculated means and covariances to disk...')
+    filepath = config['intra_inception_moments_path'] or os.path.join(config['out_root'], config['dataset'].strip('_hdf5')+'_intra_inception_moments.npz')
+    np.savez(filepath, **{'mu' : mu, 'sigma' : sigma})
 
 def main():
   # parse command line    

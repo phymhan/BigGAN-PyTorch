@@ -8,10 +8,12 @@ from torch.nn import init
 import torch.optim as optim
 import torch.nn.functional as F
 from torch.nn import Parameter as P
+from torch.nn.utils import spectral_norm
 
 import layers
+from utils import make_linear
 from sync_batchnorm import SynchronizedBatchNorm2d as SyncBatchNorm2d
-import pdb
+
 
 # Architectures for G
 # Attention is passed in in the format '32_64' to mean applying an attention
@@ -61,7 +63,7 @@ class Generator(nn.Module):
                G_lr=5e-5, G_B1=0.0, G_B2=0.999, adam_eps=1e-8,
                BN_eps=1e-5, SN_eps=1e-12, G_mixed_precision=False, G_fp16=False,
                G_init='ortho', skip_init=False, no_optim=False,
-               G_param='SN', norm_style='bn',
+               G_param='SN', norm_style='bn', use_torch_SN=False,
                **kwargs):
     super(Generator, self).__init__()
     # Channel width mulitplier
@@ -104,6 +106,7 @@ class Generator(nn.Module):
     self.fp16 = G_fp16
     # Architecture dict
     self.arch = G_arch(self.ch, self.attention)[resolution]
+    self.use_torch_SN = use_torch_SN
 
     # If using hierarchical latents, adjust z
     if self.hier:
@@ -118,13 +121,17 @@ class Generator(nn.Module):
 
     # Which convs, batchnorms, and linear layers to use
     if self.G_param == 'SN':
-      self.which_conv = functools.partial(layers.SNConv2d,
-                          kernel_size=3, padding=1,
-                          num_svs=num_G_SVs, num_itrs=num_G_SV_itrs,
-                          eps=self.SN_eps)
-      self.which_linear = functools.partial(layers.SNLinear,
-                          num_svs=num_G_SVs, num_itrs=num_G_SV_itrs,
-                          eps=self.SN_eps)
+      if self.use_torch_SN:
+        self.which_conv = lambda *a, **kw: spectral_norm(nn.Conv2d(*a, kernel_size=3, padding=1))
+        self.which_linear = lambda *a, **kw: spectral_norm(nn.Linear(*a, **kw))
+      else:
+        self.which_conv = functools.partial(layers.SNConv2d,
+                            kernel_size=3, padding=1,
+                            num_svs=num_G_SVs, num_itrs=num_G_SV_itrs,
+                            eps=self.SN_eps)
+        self.which_linear = functools.partial(layers.SNLinear,
+                            num_svs=num_G_SVs, num_itrs=num_G_SV_itrs,
+                            eps=self.SN_eps)
     else:
       self.which_conv = functools.partial(nn.Conv2d, kernel_size=3, padding=1)
       self.which_linear = nn.Linear
@@ -134,7 +141,7 @@ class Generator(nn.Module):
     self.which_embedding = nn.Embedding
     bn_linear = (functools.partial(self.which_linear, bias=False) if self.G_shared
                  else self.which_embedding)
-    self.which_bn = functools.partial(layers.ccbn,  # ccbn that is conditional
+    self.which_bn = functools.partial(layers.ccbn,
                           which_linear=bn_linear,
                           cross_replica=self.cross_replica,
                           mybn=self.mybn,
@@ -142,6 +149,7 @@ class Generator(nn.Module):
                                       else self.n_classes),
                           norm_style=self.norm_style,
                           eps=self.BN_eps)
+
 
     # Prepare model
     # If not using shared embeddings, self.shared is just a passthrough
@@ -286,7 +294,11 @@ class Discriminator(nn.Module):
                num_D_SVs=1, num_D_SV_itrs=1, D_activation=nn.ReLU(inplace=False),
                D_lr=2e-4, D_B1=0.0, D_B2=0.999, adam_eps=1e-8,
                SN_eps=1e-12, output_dim=1, D_mixed_precision=False, D_fp16=False,
-               D_init='ortho', skip_init=False, D_param='SN', **kwargs):
+               D_init='ortho', skip_init=False, D_param='SN',
+               projection=True, AC=False, TAC=False, dis_fc_dim=[1], use_torch_SN=False,
+               adaptive_loss='none', adaptive_loss_param='none', detach_weight_linear=False,
+               over_parameterize=False, naive_hybrid=False, no_proj_bias=False,
+               **kwargs):
     super(Discriminator, self).__init__()
     # Width multiplier
     self.ch = D_ch
@@ -312,20 +324,40 @@ class Discriminator(nn.Module):
     self.fp16 = D_fp16
     # Architecture
     self.arch = D_arch(self.ch, self.attention)[resolution]
+    # Additional
+    self.projection = projection
+    self.AC = AC
+    self.TAC = TAC
+    self.use_torch_SN = use_torch_SN
+    self.adaptive_loss = adaptive_loss
+    self.adaptive_loss_param = adaptive_loss_param
+    self.detach_weight_linear = detach_weight_linear
+    self.over_parameterize = over_parameterize
+    self.scalar_sigmoid = nn.Parameter(torch.tensor(0.))
+    self.scalar_sigma_x = nn.Parameter(torch.tensor(0.))
+    self.scalar_sigma_y = nn.Parameter(torch.tensor(0.))
+    self.naive_hybrid = naive_hybrid
+    if self.naive_hybrid:
+      self.projection = self.AC = self.TAC = False
 
     # Which convs, batchnorms, and linear layers to use
     # No option to turn off SN in D right now
     if self.D_param == 'SN':
-      self.which_conv = functools.partial(layers.SNConv2d,
-                          kernel_size=3, padding=1,
-                          num_svs=num_D_SVs, num_itrs=num_D_SV_itrs,
-                          eps=self.SN_eps)
-      self.which_linear = functools.partial(layers.SNLinear,
+      if self.use_torch_SN:
+        self.which_conv = lambda *a, **kw: spectral_norm(nn.Conv2d(*a, kernel_size=3, padding=1))
+        self.which_linear = lambda *a, **kw: spectral_norm(nn.Linear(*a, **kw))
+        self.which_embedding = lambda *a, **kw: spectral_norm(nn.Embedding(*a, **kw))
+      else:
+        self.which_conv = functools.partial(layers.SNConv2d,
+                            kernel_size=3, padding=1,
                             num_svs=num_D_SVs, num_itrs=num_D_SV_itrs,
                             eps=self.SN_eps)
-      self.which_embedding = functools.partial(layers.SNEmbedding,
-                               num_svs=num_D_SVs, num_itrs=num_D_SV_itrs,
-                               eps=self.SN_eps)
+        self.which_linear = functools.partial(layers.SNLinear,
+                            num_svs=num_D_SVs, num_itrs=num_D_SV_itrs,
+                            eps=self.SN_eps)
+        self.which_embedding = functools.partial(layers.SNEmbedding,
+                                num_svs=num_D_SVs, num_itrs=num_D_SV_itrs,
+                                eps=self.SN_eps)
     # Prepare model
     # self.blocks is a doubly-nested list of modules, the outer loop intended
     # to be over blocks at a given resolution (resblocks and/or self-attention)
@@ -347,9 +379,33 @@ class Discriminator(nn.Module):
     self.blocks = nn.ModuleList([nn.ModuleList(block) for block in self.blocks])
     # Linear output layer. The output dimension is typically 1, but may be
     # larger if we're e.g. turning this into a VAE with an inference output
-    self.linear = self.which_linear(self.arch['out_channels'][-1], output_dim)
+    assert not dis_fc_dim or dis_fc_dim[-1] == output_dim
+    self.linear = make_linear(self.which_linear, self.arch['out_channels'][-1], dis_fc_dim)
     # Embedding for projection discrimination
-    self.embed = self.which_embedding(self.n_classes, self.arch['out_channels'][-1])
+    if self.projection:
+      self.embed = self.which_embedding(self.n_classes, self.arch['out_channels'][-1])
+      if self.over_parameterize:
+        self.embedq = self.which_embedding(self.n_classes, self.arch['out_channels'][-1])
+    if self.AC:
+      self.linear_ac = self.which_linear(self.arch['out_channels'][-1], self.n_classes, bias=not no_proj_bias)
+    if self.TAC:
+      self.linear_tac = self.which_linear(self.arch['out_channels'][-1], self.n_classes, bias=not no_proj_bias)
+    # for sigma  : D_real*wx_real, D_fake*wx_fake, AC_real*wp_real, TAC_fake*wq_fake
+    # for sigmoid: loss(D_real)*w_real[0], loss(AC_real)*w_real[1], loss(D_fake)*w_fake[0], loss(TAC_fake)*w_fake[1]
+    if self.adaptive_loss == 'sigma':
+      which_linear = nn.Linear if self.adaptive_loss_param == 'none' else self.which_linear
+      self.linear_wx = make_linear(which_linear, self.arch['out_channels'][-1], [1], nl='softplus')
+      self.linear_wp = make_linear(which_linear, self.arch['out_channels'][-1], [1], nl='softplus')
+      self.linear_wq = make_linear(which_linear, self.arch['out_channels'][-1], [1], nl='softplus')
+    if self.adaptive_loss == 'sigmoid':
+      which_linear = nn.Linear if self.adaptive_loss_param == 'none' else self.which_linear
+      self.linear_wx = make_linear(which_linear, self.arch['out_channels'][-1], [1], nl='none')
+    
+    if self.naive_hybrid:
+      self.embed = self.which_embedding(self.n_classes, self.arch['out_channels'][-1])
+      self.psi = self.which_linear(self.arch['out_channels'][-1], 1)
+      self.linear_ac = self.which_linear(self.arch['out_channels'][-1], self.n_classes, bias=not no_proj_bias)
+      self.linear_tac = self.which_linear(self.arch['out_channels'][-1], self.n_classes, bias=not no_proj_bias)
 
     # Initialize weights
     if not skip_init:
@@ -385,6 +441,20 @@ class Discriminator(nn.Module):
         else:
           print('Init style not recognized...')
         self.param_count += sum([p.data.nelement() for p in module.parameters()])
+    # init as zero
+    if self.adaptive_loss_param == 'none':
+      for name in ['linear_wx', 'linear_wp', 'linear_wq']:
+        param = getattr(self, name, None)
+        if isinstance(param, nn.Sequential):
+          param = param[-2]  # the last fc layer is identity by default
+        w = getattr(param, 'weight', None)
+        b = getattr(param, 'bias', None)
+        if w is not None:
+          w.data.fill_(0.)
+        if b is not None:
+          b.data.fill_(0.)
+          if self.adaptive_loss == 'sigma':
+            b.data.fill_(-5.)  # log(wt) is more close to zero
     print('Param count for D''s initialized parameters: %d' % self.param_count)
 
   def forward(self, x, y=None):
@@ -395,12 +465,42 @@ class Discriminator(nn.Module):
       for block in blocklist:
         h = block(h)
     # Apply global sum pooling as in SN-GAN
-    h = torch.sum(self.activation(h), [2, 3])
+    h = torch.sum(self.activation(h), [2, 3])  # h is phi(x)
     # Get initial class-unconditional output
-    out = self.linear(h)
+    out = self.linear(h) if self.linear is not None else 0.
+    out_ac = None
+    out_tac = None
+    out_wx = None
+    out_wp = None
+    out_wq = None
+
     # Get projection of final featureset onto class vectors and add to evidence
-    out = out + torch.sum(self.embed(y) * h, 1, keepdim=True)
-    return out
+    if self.projection:
+      out = out + torch.sum(self.embed(y) * h, 1, keepdim=True)
+      if self.over_parameterize:
+        out = out - torch.sum(self.embedq(y) * h, 1, keepdim=True)
+    if self.AC:
+      out_ac = self.linear_ac(h)
+    if self.TAC:
+      out_tac = self.linear_tac(h)
+    if self.adaptive_loss == 'sigma':
+      out_wx = self.linear_wx(h.detach()) if self.detach_weight_linear else self.linear_wx(h)
+      out_wp = self.linear_wp(h.detach()) if self.detach_weight_linear else self.linear_wp(h)
+      out_wq = self.linear_wq(h.detach()) if self.detach_weight_linear else self.linear_wq(h)
+      out_wx = torch.squeeze(out_wx)
+      out_wp = torch.squeeze(out_wp)
+      out_wq = torch.squeeze(out_wq)
+    if self.adaptive_loss == 'sigmoid':
+      out_wx = self.linear_wx(h.detach()) if self.detach_weight_linear else self.linear_wx(h)
+      out_wx = torch.squeeze(out_wx)
+    
+    if self.naive_hybrid:
+      out_ac = self.linear_ac(h)
+      out_tac = self.linear_tac(h)
+      out_pd = self.psi(h) + torch.sum(self.embed(y) * h, 1, keepdim=True)
+      return out.squeeze(1), out_ac, out_tac, out_pd, None, None
+
+    return out.squeeze(1), out_ac, out_tac, out_wx, out_wp, out_wq
   
   def get_embedding(self, x, y=None):
     # Get data embedding
@@ -437,32 +537,32 @@ class G_D(nn.Module):
     # Split_D means to run D once with real data and once with fake,
     # rather than concatenating along the batch dimension.
     if split_D:
-      D_fake = self.D(G_z, gy)
+      D_fake, ac_fake, tac_f, wx_f, wp_f, wq_f, w_f = self.D(G_z, gy)
       if x is not None:
-        D_real = self.D(x, dy)
-        return D_fake, D_real
+        D_real, ac_real, tac_real, wx_r, wp_r, wq_r, w_r = self.D(x, dy)
+        ac = torch.cat([ac_fake, ac_real], 0) if ac_fake is not None else None
+        tac = torch.cat([tac_fake, tac_real], 0) if tac_fake is not None else None
+        wx = torch.cat([wx_f, wx_r], 0) if wx_f is not None else None
+        wp = torch.cat([wp_f, wp_r], 0) if wp_f is not None else None
+        wq = torch.cat([wq_f, wq_r], 0) if wq_f is not None else None
+        return D_fake, D_real, ac, tac, wx, wp, wq
       else:
         if return_G_z:
-          return D_fake, G_z
+          return D_fake, G_z, ac_fake, tac_fake, wx_f, wp_f, wq_f
         else:
-          return D_fake
+          return D_fake, ac_fake, tac_fake, wx_f, wp_f, wq_f
     # If real data is provided, concatenate it with the Generator's output
     # along the batch dimension for improved efficiency.
     else:
       D_input = torch.cat([G_z, x], 0) if x is not None else G_z
       D_class = torch.cat([gy, dy], 0) if dy is not None else gy
       # Get Discriminator output
-      D_out = self.D(D_input, D_class)
+      D_out, ac, tac, wx, wp, wq = self.D(D_input, D_class)
       if x is not None:
-        return torch.split(D_out, [G_z.shape[0], x.shape[0]]) # D_fake, D_real
+        D_fake, D_real = torch.split(D_out, [G_z.shape[0], x.shape[0]])
+        return D_fake, D_real, ac, tac, wx, wp, wq
       else:
         if return_G_z:
-          return D_out, G_z
+          return D_out, G_z, ac, tac, wx, wp, wq
         else:
-          return D_out
-  
-  def get_embedding(self, z, gy, x, dy):
-    G_z = self.G(z, self.G.shared(gy))
-    D_input = torch.cat([G_z, x], 0)
-    D_out = self.D.get_embedding(D_input)
-    return torch.split(D_out, [G_z.shape[0], x.shape[0]])
+          return D_out, ac, tac, wx, wp, wq

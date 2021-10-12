@@ -17,19 +17,139 @@ import json
 import pickle
 from argparse import ArgumentParser
 import animal_hash
-
+import math
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import torchvision
 import torchvision.transforms as transforms
 from torch.utils.data import DataLoader
-
+from layers import identity
 import datasets as dset
+import shutil
+import ast
+import pdb
 
 def prepare_parser():
   usage = 'Parser for all scripts.'
   parser = ArgumentParser(description=usage)
+
+  ### Additional ###
+  parser.add_argument('--clip_value', type=float, nargs='+', default=[1.], help='clip_value or max_norm, depending on lambda_grad_clip')
+  parser.add_argument('--lambda_clip', type=str, default='none', choices=['none', 'value', 'range'])
+  parser.add_argument('--lambda_grad_clip', type=str, default='none', choices=['none', 'value', 'norm'])
+  parser.add_argument('--gated_lambda', action='store_true')
+  parser.add_argument('--no_proj_bias', action='store_true')
+  parser.add_argument('--lambda_lr', type=float, default=0.01)
+  parser.add_argument('--lambda_penalty_weight', type=float, default=1.)
+  parser.add_argument('--max_iters', type=int, default=0)
+  parser.add_argument('--mi_weight_decay', type=float, default=1)
+  parser.add_argument('--inception_model', type=str, default='default')
+  parser.add_argument('--naive_hybrid', action='store_true')
+  parser.add_argument('--which_metrics', type=str, nargs='*', default=['IS', 'FID', 'IntraFID', 'LPIPS'], help='Test and DRS')
+  parser.add_argument('--index_filename', type=str, default='')
+  parser.add_argument('--samples_per_class', type=int, default=10)
+  parser.add_argument('--test_G_model_path', type=str, default='')
+  parser.add_argument('--num_burnin_samples', type=int, default=10000)
+  parser.add_argument('--gamma_percentile', type=float, default=0.60)
+  parser.add_argument('--no_drs', action='store_true')
+  parser.add_argument('--max_iters_drs', type=int, default=10000)
+  parser.add_argument('--use_deterministic_drs', action='store_true')
+  parser.add_argument('--fair_drs_classes', type=str, default='', help='which classes to perform DRS?')
+  parser.add_argument('--fair_use_label_flipping', action='store_true')
+  parser.add_argument('--fair_label_flip_target_hist', type=str, default='', help='target histogram for label flipping')
+  parser.add_argument('--fair_label_flip_type', type=str, default='random')
+  parser.add_argument('--fair_label_flip_rate_range', type=str2list, default=[])
+  parser.add_argument('--fair_label_flip_iter_range', type=str2list, default=[])
+  parser.add_argument('--fair_which_div', type=str, default='none', choices=['jsd', 'wgan', 'gan', 'none'])
+  parser.add_argument('--fair_weight_div', type=float, default=1e-3)
+  parser.add_argument('--use_custom_dataset', action='store_true')
+  parser.add_argument('--image_size', type=int, default=64, help='only valid if use_custom_dataset')
+  parser.add_argument('--num_classes', type=int, default=2, help='only valid if use_custom_dataset')
+  parser.add_argument('--num_classes_per_sheet', type=int, default=50, help='only valid if use_custom_dataset')
+  parser.add_argument('--inception_moments_path', type=str, default=None)
+  parser.add_argument('--intra_inception_moments_path', type=str, default='')
+  parser.add_argument('--use_lpips', action='store_true')
+  parser.add_argument('--save_test_iteration', action='store_true')
+  parser.add_argument('--test_prefix', type=str, default='test')
+  parser.add_argument('--intra_fid_classes', type=str, default='', help='npy file path or list as str')
+  parser.add_argument('--lpips_classes', type=str, default='', help='npy file path or list as str')
+  parser.add_argument('--torch_fid_num_iters', type=int, default=30)
+  parser.add_argument('--load_single_inception_moments', action='store_true', help='load single file for mu and sigma?')
+  parser.add_argument('--over_parameterize', action='store_true')
+  parser.add_argument('--hybrid_noisy', action='store_true', help='this was a bug')
+  parser.add_argument('--detach_weight_linear', action='store_true')
+  parser.add_argument('--add_weight_penalty', action='store_true')
+  parser.add_argument('--f_div_loss', type=str, default='revkl')
+  parser.add_argument('--use_torch_SN', action='store_true')
+  parser.add_argument('--custom_inception_model_path', type=str, default='', help='if not empty, load custom inception model')
+  parser.add_argument('--custom_num_classes', type=int, default=1000, help='num classes')
+  parser.add_argument('--optimizer', type=str, default='adam', help='([sgd | adam] default: %(default)s)')
+  # parser.add_argument('--debug_mode', action='store_true')
+  parser.add_argument('--use_hybrid', action='store_true')
+  parser.add_argument('--use_scaled_bce_logits_with_weighted_ce_loss', action='store_true')
+  parser.add_argument('--adaptive_loss', type=str, default='', help='([none | sigma | softmax])')
+  parser.add_argument('--adaptive_loss_param', type=str, default='none', help='([none | sn])')
+  parser.add_argument('--adaptive_loss_detach', action='store_true', help='detach weight when training G?')
+  parser.add_argument('--adaptive_gen_loss', action='store_true')  # TODO: will be removed in clean version
+  parser.add_argument('--adaptive_gen_loss_detach', action='store_true')  # TODO: will be removed in clean version
+  parser.add_argument('--adaptive_gen_loss_ignore_log_penalty', action='store_true')  # TODO: will be removed in clean version
+  parser.add_argument('--weighted_hinge_loss', type=str, default='inside')  # TODO: will be removed in clean version
+  parser.add_argument('--MI_P_type', type=str, default='ce', help='([ce | mine | eta] default: %(default)s)')
+  parser.add_argument('--MI_Q_type', type=str, default='ce', help='([ce | mine | eta] default: %(default)s)')
+  parser.add_argument('--no_add_bias', action='store_false', dest='add_bias', default=True,
+                      help='Add bias in TP and TQ? (default: %(default)s)')
+  parser.add_argument('--linear_no_sn', action='store_true')
+  parser.add_argument('--add_log_ratio_y', action='store_true')
+  parser.add_argument('--psi_dim', type=int, nargs='*', default=[1], help='fc dims for linear layers in T')
+  parser.add_argument('--dis_fc_dim', type=int, nargs='*', default=[1], help='fc dims for dis_fc')
+  parser.add_argument('--log_sigma_dim', type=int, nargs='*', default=[1], help='fc dims for log sigma')
+  parser.add_argument('--log_sigma_sn', action='store_false', dest='log_sigma_no_sn', default=True)
+  parser.add_argument('--log_sigma_nl', type=str, default='softplus',
+    help='Add non-linear after last linear [relu | none | tanh | softplus]')
+  parser.add_argument('--use_torch', action='store_true', dest='use_torch', default=False,
+                      help='Use torch when computing FID? (default: %(default)s)')
+  parser.add_argument('--use_torch_intra', action='store_true', dest='use_torch_intra', default=False,
+                      help='Use torch when computing Intra-FID? (default: %(default)s)')
+  parser.add_argument(
+    '--tensorboard', action='store_true', default=False,
+    help='Use Tensorboard? (default: %(default)s)')
+  parser.add_argument(
+    '--GAN_loss', type=str, default='hinge',
+    help='GAN loss ([hinge | dcgan | vanilla | lsgan] default: %(default)s)')
+  parser.add_argument(
+    '--MI_loss', type=str, default='identity',
+    help='MI loss ([hinge | identity] default: %(default)s)')
+  parser.add_argument(
+    '--loss_type', type=str, default='Projection',
+    help='Loss type ([Projection | AC | TAC | MINE | fCGAN | WDM] default: %(default)s)')
+  parser.add_argument(
+    '--no_projection', action='store_false', dest='projection', default=True,
+    help='Use Projection? (default: %(default)s)')
+  parser.add_argument(
+    '--AC', action='store_true', default=False,
+    help='Use AC? (default: %(default)s)')
+  parser.add_argument(
+    '--TAC', action='store_true', default=False,
+    help='Use Twin AC? (default: %(default)s)')
+  parser.add_argument(
+    '--TP', action='store_true', default=False,
+    help='Use MINE for real data? (default: %(default)s)')
+  parser.add_argument(
+    '--TQ', action='store_true', default=False,
+    help='Use MINE for fake data? (default: %(default)s)')
+  parser.add_argument(
+    '--use_softmax', action='store_true', default=False,
+    help='Use softmax in MINE? (default: %(default)s)')
+  parser.add_argument(
+    '--AC_weight', type=float, default=1.0,
+    help='Weight for AC loss (default: %(default)s)')
+  parser.add_argument(
+    '--MI_weight', type=float, default=1.0,
+    help='Weight for MINE or fCGAN loss (default: %(default)s)')
+  parser.add_argument(
+    '--train_AC_on_fake', action='store_true', default=False,
+    help='Train AC on fake? (default: %(default)s)')
   
   ### Dataset/Dataloader stuff ###
   parser.add_argument(
@@ -46,7 +166,7 @@ def prepare_parser():
          '(default: %(default)s)')
   parser.add_argument(
     '--no_pin_memory', action='store_false', dest='pin_memory', default=True,
-    help='Pin data into memory through dataloader? (default: %(default)s)') 
+    help='Pin data into memory through dataloader? (default: %(default)s)')
   parser.add_argument(
     '--shuffle', action='store_true', default=False,
     help='Shuffle the data (strongly recommended)? (default: %(default)s)')
@@ -56,8 +176,7 @@ def prepare_parser():
   parser.add_argument(
     '--use_multiepoch_sampler', action='store_true', default=False,
     help='Use the multi-epoch sampler for dataloader? (default: %(default)s)')
-  
-  
+
   ### Model stuff ###
   parser.add_argument(
     '--model', type=str, default='BigGAN',
@@ -233,12 +352,25 @@ def prepare_parser():
     '--no_fid', action='store_true', default=False,
     help='Calculate IS only, not FID? (default: %(default)s)')
   parser.add_argument(
+    '--no_intra_fid', action='store_true', default=False,
+    help='Do not calculate Intra-FID? (default: %(default)s)')
+  parser.add_argument(
     '--test_every', type=int, default=5000,
     help='Test every X iterations (default: %(default)s)')
+  parser.add_argument(
+    '--test_intra_fid_every', type=int, default=0,
+    help='Test intra-FID every X iterations (default: %(default)s)')
+  parser.add_argument(
+    '--test_lpips_every', type=int, default=0,
+    help='Test LPIPS every X iterations (default: %(default)s)')
   parser.add_argument(
     '--num_inception_images', type=int, default=50000,
     help='Number of samples to compute inception metrics with '
          '(default: %(default)s)')
+  parser.add_argument('--num_intra_inception_images', type=int, default=2000,
+    help='Number of samples to compute inception metrics with (default: %(default)s)')
+  parser.add_argument('--num_lpips_images', type=int, default=50000,
+    help='Number of samples to compute inception metrics with (default: %(default)s)')
   parser.add_argument(
     '--hashname', action='store_true', default=False,
     help='Use a hash of the experiment name instead of the full config '
@@ -327,14 +459,22 @@ def prepare_parser():
   
   ### Which train function ###
   parser.add_argument(
-    '--which_train_fn', type=str, default='GAN',
+    '--which_train_fn', type=str, default='ACGAN',
     help='How2trainyourbois (default: %(default)s)')  
   
   ### Resume training stuff
   parser.add_argument(
-    '--load_weights', type=str, default='',
+    '--load_weights', type=str, default=[], nargs='*',
     help='Suffix for which weights to load (e.g. best0, copy0) '
          '(default: %(default)s)')
+  parser.add_argument(
+    '--load_weights_drs', type=str, default=['drs_itr1000'], nargs='*',
+    help='Suffix for which weights to load (e.g. drs_itr1000) '
+         '(default: %(default)s)')
+  # parser.add_argument(
+  #   '--load_weights', type=str, default='',
+  #   help='Suffix for which weights to load (e.g. best0, copy0) '
+  #        '(default: %(default)s)')
   parser.add_argument(
     '--resume', action='store_true', default=False,
     help='Resume training? (default: %(default)s)')
@@ -358,8 +498,7 @@ def prepare_parser():
   parser.add_argument(
     '--sv_log_interval', type=int, default=10,
     help='Iteration interval for logging singular values '
-         ' (default: %(default)s)') 
-   
+         ' (default: %(default)s)')
   return parser
 
 # Arguments for sample.py; not presently used in train.py
@@ -401,35 +540,65 @@ def add_sample_parser(parser):
   return parser
 
 # Convenience dicts
-dset_dict = {'I32': dset.ImageFolder, 'I64': dset.ImageFolder, 
+dset_dict = {'I32': dset.ImageFolder, 'I64': dset.ImageFolder,
              'I128': dset.ImageFolder, 'I256': dset.ImageFolder,
-             'I32_hdf5': dset.ILSVRC_HDF5, 'I64_hdf5': dset.ILSVRC_HDF5, 
+             'I32_hdf5': dset.ILSVRC_HDF5, 'I64_hdf5': dset.ILSVRC_HDF5,
              'I128_hdf5': dset.ILSVRC_HDF5, 'I256_hdf5': dset.ILSVRC_HDF5,
-             'C10': dset.CIFAR10, 'C100': dset.CIFAR100}
+             'T64': dset.ImageFolder,
+             'M64': dset.ImageFolder, 'M128': dset.ImageFolder,
+             'C10': dset.CIFAR10, 'C100': dset.CIFAR100, 'C100IB': dset.ImageFolder,
+             'V200': dset.ImageFolder, 'V200_hdf5': dset.ILSVRC_HDF5,
+             'V500': dset.ImageFolder, 'V500_hdf5': dset.ILSVRC_HDF5,
+             'V1000': dset.ImageFolder, 'V1000_hdf5': dset.ILSVRC_HDF5,
+             'V2000': dset.ImageFolder, 'V2000_hdf5': dset.ILSVRC_HDF5}
 imsize_dict = {'I32': 32, 'I32_hdf5': 32,
                'I64': 64, 'I64_hdf5': 64,
                'I128': 128, 'I128_hdf5': 128,
                'I256': 256, 'I256_hdf5': 256,
-               'C10': 32, 'C100': 32}
+               'T64': 64, 'M64': 64, 'M128': 128,
+               'C10': 32, 'C100': 32, 'C100IB': 32,
+               'V200': 64, 'V200_hdf5': 64,
+               'V500': 64, 'V500_hdf5': 64,
+               'V1000': 64, 'V1000_hdf5': 64,
+               'V2000': 64, 'V2000_hdf5': 64}
 root_dict = {'I32': 'ImageNet', 'I32_hdf5': 'ILSVRC32.hdf5',
              'I64': 'ImageNet', 'I64_hdf5': 'ILSVRC64.hdf5',
              'I128': 'ImageNet', 'I128_hdf5': 'ILSVRC128.hdf5',
              'I256': 'ImageNet', 'I256_hdf5': 'ILSVRC256.hdf5',
-             'C10': 'cifar', 'C100': 'cifar'}
+             'T64': 'Tiny-ImageNet-200',
+             'M64': 'Mini-ImageNet-100', 'M128': 'Mini-ImageNet-100',
+             'C10': 'cifar', 'C100': 'cifar', 'C100IB': 'cifar100-imbalanced',
+             'V200': 'V200', 'V200_hdf5': 'VGGFace200_64.hdf5',
+             'V500': 'V500', 'V500_hdf5': 'VGGFace500_64.hdf5',
+             'V1000': 'V1000', 'V1000_hdf5': 'VGGFace1000_64.hdf5',
+             'V2000': 'V2000', 'V2000_hdf5': 'VGGFace2000_64.hdf5'}
 nclass_dict = {'I32': 1000, 'I32_hdf5': 1000,
                'I64': 1000, 'I64_hdf5': 1000,
                'I128': 1000, 'I128_hdf5': 1000,
                'I256': 1000, 'I256_hdf5': 1000,
-               'C10': 10, 'C100': 100}
+               'T64': 200,
+               'M64': 100, 'M128': 100,
+               'C10': 10, 'C100': 100, 'C100IB': 100,
+               'V200': 200, 'V200_hdf5': 200,
+               'V500': 500, 'V500_hdf5': 500,
+               'V1000': 1000, 'V1000_hdf5': 1000,
+               'V2000': 2000, 'V2000_hdf5': 2000}
 # Number of classes to put per sample sheet               
 classes_per_sheet_dict = {'I32': 50, 'I32_hdf5': 50,
                           'I64': 50, 'I64_hdf5': 50,
                           'I128': 20, 'I128_hdf5': 20,
                           'I256': 20, 'I256_hdf5': 20,
-                          'C10': 10, 'C100': 100}
+                          'T64': 50, 'M64': 50, 'M128': 50,
+                          'C10': 10, 'C100': 100, 'C100IB': 100,
+                          'V200': 100, 'V200_hdf5': 100,
+                          'V500': 100, 'V500_hdf5': 100,
+                          'V1000': 100, 'V1000_hdf5': 100,
+                          'V2000': 100, 'V2000_hdf5': 100}
 activation_dict = {'inplace_relu': nn.ReLU(inplace=True),
                    'relu': nn.ReLU(inplace=False),
-                   'ir': nn.ReLU(inplace=True),}
+                   'ir': nn.ReLU(inplace=True),
+                   'none': identity(),
+                   'softplus': nn.Softplus()}
 
 class CenterCropLongEdge(object):
   """Crops the given PIL Image on the long edge.
@@ -470,7 +639,7 @@ class RandomCropLongEdge(object):
           else np.random.randint(low=0,high=img.size[0] - size[0]))
     j = (0 if size[1] == img.size[1]
           else np.random.randint(low=0,high=img.size[1] - size[1]))
-    return transforms.functional.crop(img, i, j, size[0], size[1])
+    return transforms.functional.crop(img, j, i, size[0], size[1])
 
   def __repr__(self):
     return self.__class__.__name__
@@ -525,52 +694,64 @@ def get_data_loaders(dataset, data_root=None, augment=False, batch_size=64,
                      num_workers=8, shuffle=True, load_in_mem=False, hdf5=False,
                      pin_memory=True, drop_last=True, start_itr=0,
                      num_epochs=500, use_multiepoch_sampler=False,
+                     use_custom_dataset=False, image_size=0, index_filename='',
+                     return_dataset=False,
                      **kwargs):
 
   # Append /FILENAME.hdf5 to root if using hdf5
-  data_root += '/%s' % root_dict[dataset]
-  print('Using dataset root location %s' % data_root)
-
-  which_dataset = dset_dict[dataset]
+  if not use_custom_dataset:
+    data_root += '/%s' % root_dict[dataset]
+    print('Using dataset root location %s' % data_root)
+    which_dataset = dset_dict[dataset]
+    image_size = imsize_dict[dataset]
+  else:
+    if data_root.endswith('.hdf5'):
+      which_dataset = dset.ILSVRC_HDF5
+    else:
+      which_dataset = dset.ImageFolder
+    image_size = image_size
   norm_mean = [0.5,0.5,0.5]
   norm_std = [0.5,0.5,0.5]
-  image_size = imsize_dict[dataset]
+  
   # For image folder datasets, name of the file where we store the precomputed
   # image locations to avoid having to walk the dirs every time we load.
-  dataset_kwargs = {'index_filename': '%s_imgs.npz' % dataset}
+  dataset_kwargs = {'index_filename': index_filename or '%s_imgs.npz' % dataset}
   
   # HDF5 datasets have their own inbuilt transform, no need to train_transform  
-  if 'hdf5' in dataset:
+  if ('hdf5' in dataset) or data_root.endswith('.hdf5'):
     train_transform = None
   else:
     if augment:
       print('Data will be augmented...')
-      if dataset in ['C10', 'C100']:
+      if dataset in ['C10', 'C100', 'C100IB']:
         train_transform = [transforms.RandomCrop(32, padding=4),
                            transforms.RandomHorizontalFlip()]
       else:
         train_transform = [RandomCropLongEdge(),
-                         transforms.Resize(image_size),
-                         transforms.RandomHorizontalFlip()]
+                           transforms.Resize(image_size),
+                           transforms.RandomHorizontalFlip()]
     else:
       print('Data will not be augmented...')
-      if dataset in ['C10', 'C100']:
+      if dataset in ['C10', 'C100', 'C100IB']:
         train_transform = []
       else:
         train_transform = [CenterCropLongEdge(), transforms.Resize(image_size)]
       # train_transform = [transforms.Resize(image_size), transforms.CenterCrop]
     train_transform = transforms.Compose(train_transform + [
-                     transforms.ToTensor(),
-                     transforms.Normalize(norm_mean, norm_std)])
+                      transforms.ToTensor(),
+                      transforms.Normalize(norm_mean, norm_std)])
   train_set = which_dataset(root=data_root, transform=train_transform,
                             load_in_mem=load_in_mem, **dataset_kwargs)
-
+  if return_dataset:
+    return train_set
   # Prepare loader; the loaders list is for forward compatibility with
   # using validation / test splits.
-  loaders = []   
+  loaders = []
+  drop_last = True
   if use_multiepoch_sampler:
     print('Using multiepoch sampler from start_itr %d...' % start_itr)
-    loader_kwargs = {'num_workers': num_workers, 'pin_memory': pin_memory}
+    loader_kwargs = {'num_workers': num_workers, 'pin_memory': pin_memory,
+      'drop_last': drop_last}
     sampler = MultiEpochSampler(train_set, num_epochs, start_itr, batch_size)
     train_loader = DataLoader(train_set, batch_size=batch_size,
                               sampler=sampler, **loader_kwargs)
@@ -605,7 +786,7 @@ def prepare_root(config):
   for key in ['weights_root', 'logs_root', 'samples_root']:
     if not os.path.exists(config[key]):
       print('Making directory %s for %s...' % (config[key], key))
-      os.mkdir(config[key])
+      os.makedirs(config[key])
 
 
 # Simple wrapper that applies EMA to a model. COuld be better done in 1.0 using
@@ -693,16 +874,19 @@ def save_weights(G, D, state_dict, weights_root, experiment_name,
     print('Saving weights to %s/%s...' % (root, name_suffix))
   else:
     print('Saving weights to %s...' % root)
-  torch.save(G.state_dict(), 
-              '%s/%s.pth' % (root, join_strings('_', ['G', name_suffix])))
-  torch.save(G.optim.state_dict(), 
-              '%s/%s.pth' % (root, join_strings('_', ['G_optim', name_suffix])))
-  torch.save(D.state_dict(), 
-              '%s/%s.pth' % (root, join_strings('_', ['D', name_suffix])))
-  torch.save(D.optim.state_dict(),
-              '%s/%s.pth' % (root, join_strings('_', ['D_optim', name_suffix])))
-  torch.save(state_dict,
-              '%s/%s.pth' % (root, join_strings('_', ['state_dict', name_suffix])))
+  if G is not None:
+    torch.save(G.state_dict(), 
+                '%s/%s.pth' % (root, join_strings('_', ['G', name_suffix])))
+    torch.save(G.optim.state_dict(), 
+                '%s/%s.pth' % (root, join_strings('_', ['G_optim', name_suffix])))
+  if D is not None:
+    torch.save(D.state_dict(), 
+                '%s/%s.pth' % (root, join_strings('_', ['D', name_suffix])))
+    torch.save(D.optim.state_dict(),
+                '%s/%s.pth' % (root, join_strings('_', ['D_optim', name_suffix])))
+  if state_dict is not None:
+    torch.save(state_dict,
+                '%s/%s.pth' % (root, join_strings('_', ['state_dict', name_suffix])))
   if G_ema is not None:
     torch.save(G_ema.state_dict(), 
                 '%s/%s.pth' % (root, join_strings('_', ['G_ema', name_suffix])))
@@ -710,7 +894,7 @@ def save_weights(G, D, state_dict, weights_root, experiment_name,
 
 # Load a model's weights, optimizer, and the state_dict
 def load_weights(G, D, state_dict, weights_root, experiment_name, 
-                 name_suffix=None, G_ema=None, strict=True, load_optim=True):
+                 name_suffix=None, G_ema=None, strict=True, load_optim=True, model_path=None):
   root = '/'.join([weights_root, experiment_name])
   if name_suffix:
     print('Loading %s weights from %s...' % (name_suffix, root))
@@ -731,12 +915,14 @@ def load_weights(G, D, state_dict, weights_root, experiment_name,
       D.optim.load_state_dict(
         torch.load('%s/%s.pth' % (root, join_strings('_', ['D_optim', name_suffix]))))
   # Load state dict
-  for item in state_dict:
-    state_dict[item] = torch.load('%s/%s.pth' % (root, join_strings('_', ['state_dict', name_suffix])))[item]
+  if state_dict is not None:
+    state_dict_loaded = torch.load('%s/%s.pth' % (root, join_strings('_', ['state_dict', name_suffix])))
+    for item in state_dict:
+      if item in state_dict_loaded:
+        state_dict[item] = state_dict_loaded[item]
   if G_ema is not None:
     G_ema.load_state_dict(
-      torch.load('%s/%s.pth' % (root, join_strings('_', ['G_ema', name_suffix]))),
-      strict=strict)
+      torch.load('%s/%s.pth' % (root, join_strings('_', ['G_ema', name_suffix]))), strict=strict)
 
 
 ''' MetricsLogger originally stolen from VoxNet source code.
@@ -862,49 +1048,161 @@ def progress(items, desc='', total=None, min_delay=0.1, displaytype='s1k'):
 
 
 # Sample function for use with inception metrics
-def sample(G, z_, y_, config):
+def sample(G, z_, y_, config, z=None, y=None, use_drs=False):
+  # assert(use_drs ==  False)
   with torch.no_grad():
     z_.sample_()
     y_.sample_()
+    zg, yg = z_, y_
+    if torch.is_tensor(z):
+      zg = z
+    if y is not None:
+      if torch.is_tensor(y):
+        yg = y
+      else:
+        yg.fill_(y)
     if config['parallel']:
-      G_z =  nn.parallel.data_parallel(G, (z_, G.shared(y_)))
+      G_z =  nn.parallel.data_parallel(G, (zg, G.shared(yg)))
     else:
-      G_z = G(z_, G.shared(y_))
-    return G_z, y_
+      G_z = G(zg, G.shared(yg))
+    return G_z, yg
+
+
+def sample_drs(G, z_, y_, config, z=None, y=None, D=None,
+               M_state=None, use_drs=True, use_deterministic=False):
+  with torch.no_grad():
+    z_.sample_()
+    y_.sample_()
+    zg, yg = z_, y_
+    if torch.is_tensor(z):
+      zg = z
+    if y is not None:
+      if torch.is_tensor(y):
+        yg = y
+      else:
+        yg.fill_(y)
+    if config['parallel']:
+      G_z =  nn.parallel.data_parallel(G, (zg, G.shared(yg)))
+    else:
+      G_z = G(zg, G.shared(yg))
+    if use_drs and (D is not None) and (M_state is not None):
+      logits = D(G_z, yg)
+      logits = logits.reshape(-1).cpu().numpy()
+      batch_ratio = np.exp(logits)
+      max_idx = np.argmax(batch_ratio)
+      max_ratio = batch_ratio[max_idx]
+      if max_ratio > M_state['M']:
+        M_state['M'] = max_ratio
+        M_state['logit'] = logits[max_idx]
+      max_M, max_logit = M_state['M'], M_state['logit']
+      # Calculate F_hat
+      Fs = logits - max_logit - np.log(1 - np.exp(logits - max_logit - 1e-8))
+      gamma = np.percentile(Fs, config['gamma_percentile'])
+      F_hat = Fs - gamma
+      acceptance_prob = 1./(1 + np.exp(-F_hat))  # sigmoid
+      x_accept = []
+      y_accept = []
+      num_accepted = 0
+      for idx, (sample, label) in enumerate(zip(G_z, yg)):
+        probability = np.random.uniform(0, 1)
+        # print ('prob : %.4f p : %.4f F_hat : %.4f F : %.4f'%(probability, acceptance_prob[idx], F_hat[idx], Fs[idx]))
+        if (probability <= acceptance_prob[idx] or 
+           (use_deterministic and acceptance_prob[idx] >= config['gamma_percentile'])):
+          x_accept.append(sample)
+          y_accept.append(label)
+          num_accepted += 1
+      G_z = torch.stack(x_accept) if num_accepted > 0 else []
+      yg = torch.stack(y_accept) if num_accepted > 0 else []
+    return G_z, yg
 
 
 # Sample function for sample sheets
 def sample_sheet(G, classes_per_sheet, num_classes, samples_per_class, parallel,
-                 samples_root, experiment_name, folder_number, z_=None):
+                 samples_root, experiment_name, folder_number, z_=None,
+                 sample=None, use_drs=False, drs_classes=[]):
+  # drs_classes is not supported for sample_sheet for now
   # Prepare sample directory
   if not os.path.isdir('%s/%s' % (samples_root, experiment_name)):
     os.mkdir('%s/%s' % (samples_root, experiment_name))
-  if not os.path.isdir('%s/%s/%d' % (samples_root, experiment_name, folder_number)):
-    os.mkdir('%s/%s/%d' % (samples_root, experiment_name, folder_number))
+  if not os.path.isdir(f'{samples_root}/{experiment_name}/{folder_number}'):
+    os.mkdir(f'{samples_root}/{experiment_name}/{folder_number}')
   # loop over total number of sheets
   for i in range(num_classes // classes_per_sheet):
     ims = []
     y = torch.arange(i * classes_per_sheet, (i + 1) * classes_per_sheet, device='cuda')
+    if sample is not None:
+      classes = list(range(i * classes_per_sheet, (i + 1) * classes_per_sheet))
     for j in range(samples_per_class):
       if (z_ is not None) and hasattr(z_, 'sample_') and classes_per_sheet <= z_.size(0):
         z_.sample_()
       else:
-        z_ = torch.randn(classes_per_sheet, G.dim_z, device='cuda')        
+        z_ = torch.randn(classes_per_sheet, G.dim_z, device='cuda')
+      if G.fp16:
+        z_ = z_.half()
       with torch.no_grad():
-        if parallel:
-          o = nn.parallel.data_parallel(G, (z_[:classes_per_sheet], G.shared(y)))
+        if sample is None:
+          if parallel:
+            o = nn.parallel.data_parallel(G, (z_[:classes_per_sheet], G.shared(y)))
+          else:
+            o = G(z_[:classes_per_sheet], G.shared(y))
         else:
-          o = G(z_[:classes_per_sheet], G.shared(y))
-
+          # Use sample() if not None
+          img_cls = {c: [] for c in classes}
+          cnt_cls = {c: 0 for c in classes}
+          while True:
+            oa, ya = sample(z=z_[:classes_per_sheet], y=y, use_drs=use_drs)
+            if len(oa) == 0:
+              continue
+            for image, label in zip(oa, ya):
+              img_cls[label.cpu().item()].append(image)
+              cnt_cls[label.cpu().item()] += 1
+            if all(np.array(list(cnt_cls.values())) >= 1):
+              break
+            if (z_ is not None) and hasattr(z_, 'sample_') and classes_per_sheet <= z_.size(0):
+              z_.sample_()
+            else:
+              z_ = torch.randn(classes_per_sheet, G.dim_z, device='cuda')
+          o = torch.stack([img_cls[c][0] for c in classes], dim=0)
       ims += [o.data.cpu()]
     # This line should properly unroll the images
     out_ims = torch.stack(ims, 1).view(-1, ims[0].shape[1], ims[0].shape[2], 
                                        ims[0].shape[3]).data.float().cpu()
     # The path for the samples
-    image_filename = '%s/%s/%d/samples%d.jpg' % (samples_root, experiment_name, 
-                                                 folder_number, i)
+    image_filename = f'{samples_root}/{experiment_name}/{folder_number}/samples{i}.jpg'
     torchvision.utils.save_image(out_ims, image_filename,
                                  nrow=samples_per_class, normalize=True)
+
+
+# Sample pairs
+def sample_pairs(G, G_batch_size, samples_per_class, parallel,
+                 samples_root, experiment_name, folder_number='pairs', z_=None, y_=None):
+  # Prepare sample directory
+  if not os.path.isdir('%s/%s' % (samples_root, experiment_name)):
+    os.mkdir('%s/%s' % (samples_root, experiment_name))
+  if not os.path.isdir(f'{samples_root}/{experiment_name}/{folder_number}'):
+    os.mkdir(f'{samples_root}/{experiment_name}/{folder_number}')
+  # loop over batches
+  ims = {0: [], 1: []}
+  for i in range(max(1, math.ceil(1.0*samples_per_class/G_batch_size))):
+    for j in [0, 1]:
+      if (z_ is not None) and hasattr(z_, 'sample_') and G_batch_size <= z_.size(0):
+        z_.sample_()
+      else:
+        z_ = torch.randn(G_batch_size, G.dim_z, device='cuda')
+      y_.fill_(j)
+      with torch.no_grad():
+        if parallel:
+          o = nn.parallel.data_parallel(G, (z_[:G_batch_size], G.shared(y_)))
+        else:
+          o = G(z_[:G_batch_size], G.shared(y_))
+      ims[j] += [o.data.cpu()]
+  ims = [torch.cat(ims[y], dim=0).data.float().cpu() for y in [0, 1]]
+  for j in range(samples_per_class):
+    image_filename = f'{samples_root}/{experiment_name}/{folder_number}/pair{j:04d}.jpg'
+    out_im = []
+    for y in [0, 1]:
+      out_im.append(ims[y][j])
+    torchvision.utils.save_image(torch.stack(out_im), image_filename, nrow=2, normalize=True)
 
 
 # Interp function; expects x0 and x1 to be of shape (shape0, 1, rest_of_shape..)
@@ -943,9 +1241,7 @@ def interp_sheet(G, num_per_sheet, num_midpoints, num_classes, parallel,
     else:
       out_ims = G(zs, ys).data.cpu()
   interp_style = '' + ('Z' if not fix_z else '') + ('Y' if not fix_y else '')
-  image_filename = '%s/%s/%d/interp%s%d.jpg' % (samples_root, experiment_name,
-                                                folder_number, interp_style,
-                                                sheet_number)
+  image_filename = f'{samples_root}/{experiment_name}/{folder_number}/interp{interp_style}{sheet_number}.jpg'
   torchvision.utils.save_image(out_ims, image_filename,
                                nrow=num_midpoints + 2, normalize=True)
 
@@ -1084,16 +1380,16 @@ class Distribution(torch.Tensor):
 
 # Convenience function to prepare a z and y vector
 def prepare_z_y(G_batch_size, dim_z, nclasses, device='cuda', 
-                fp16=False,z_var=1.0):
+                fp16=False, z_var=1.0):
   z_ = Distribution(torch.randn(G_batch_size, dim_z, requires_grad=False))
   z_.init_distribution('normal', mean=0, var=z_var)
-  z_ = z_.to(device,torch.float16 if fp16 else torch.float32)   
+  z_ = z_.to(device, torch.float16 if fp16 else torch.float32)
   
   if fp16:
     z_ = z_.half()
 
   y_ = Distribution(torch.zeros(G_batch_size, requires_grad=False))
-  y_.init_distribution('categorical',num_categories=nclasses)
+  y_.init_distribution('categorical', num_categories=nclasses)
   y_ = y_.to(device, torch.int64)
   return z_, y_
 
@@ -1191,3 +1487,185 @@ class Adam16(Optimizer):
         p.data = state['fp32_p'].half()
 
     return loss
+
+
+class ConstEmbedding(nn.Module):
+  def __init__(self, n_classes=1000, values=None):
+    super(ConstEmbedding, self).__init__()
+    self.embed = nn.Embedding(n_classes, 1)
+    self.entropy = 0.
+
+    # init weights
+    if values is not None:
+      self.embed.weight.data.copy_(torch.from_numpy(np.log(values)).view(n_classes, 1))
+      self.entropy = -np.sum(values * np.log(values))
+
+  def forward(self, y):
+    return self.embed(y)
+
+
+def prepare_logpy(n_classes, uniform, dataset, data_root, device='cuda', fp16=False):
+  dataset = dataset.strip('_hdf5')
+  if uniform:
+    values = np.ones((n_classes, 1)) * (1. / n_classes)
+  else:
+    values = np.load(os.path.join(data_root, dataset+'_labels.npz'))['prior']
+  embed = ConstEmbedding(n_classes, values)
+  embed = embed.to(device, torch.float16 if fp16 else torch.float32)
+  if fp16:
+    embed = embed.half()
+  return embed
+
+
+def print_config(parser, config):
+  message = ''
+  message += '---------------------------- Config -----------------------------\n'
+  for k, v in sorted(config.items()):
+    comment = ''
+    default = parser.get_default(k)
+    if v != default:
+      comment = '\t[default: %s]' % str(default)
+    message += '{:>25}: {:<30}{}\n'.format(str(k), str(v), comment)
+  message += '----------------------------- End -------------------------------'
+  print(message)
+
+  # save to the disk
+  experiment_name = (config['experiment_name'] if config['experiment_name']
+                     else name_from_config(config))
+  experiment_dir = '%s/%s/' % (config['logs_root'], experiment_name)
+  if not os.path.exists(experiment_dir):
+    os.makedirs(experiment_dir)
+  file_name = os.path.join(experiment_dir, 'config.txt')
+  with open(file_name, 'wt') as cfg_file:
+    cfg_file.write(message)
+    cfg_file.write('\n')
+
+  # save command to disk
+  file_name = os.path.join(experiment_dir, 'command.txt')
+  with open(file_name, 'wt') as cmd_file:
+    cmd_file.write('(%s) ' % os.getenv('HOSTNAME'))
+    if os.getenv('CUDA_VISIBLE_DEVICES'):
+      cmd_file.write('CUDA_VISIBLE_DEVICES=%s ' % os.getenv('CUDA_VISIBLE_DEVICES'))
+    cmd_file.write(' '.join(sys.argv))
+    cmd_file.write('\n')
+
+
+def append_npy(filename, item):
+  if not isinstance(item, np.ndarray):
+    item = np.array(item)
+  item = np.expand_dims(item, axis=0)
+  if os.path.exists(filename):
+    arr = np.load(filename)
+    try:
+      arr = np.concatenate([arr, item], axis=0)
+    except:
+      print(f'Numpy array dimension mismatch: arr.shape is {arr.shape}, item.shape is {item.shape}.')
+      print(f'Backing up {filename} and creating a new file...')
+      shutil.copyfile(filename, filename+f'.backup_{datetime.datetime.now()}.npy')
+      arr = item
+  else:
+    arr = item
+  np.save(filename, arr)
+
+
+def make_linear(which_linear, input_dim, output_dims, bias=True, nl='none'):
+  # nl is only applied after the last linear, if any
+  n_layers = len(output_dims)
+  blocks = []
+  nf_prev = input_dim
+  for i in range(n_layers - 1):
+    nf = output_dims[i]
+    blocks += [which_linear(nf_prev, nf), nn.Tanh()]
+    nf_prev = nf
+  if n_layers > 0:
+    blocks += [which_linear(nf_prev, output_dims[-1], bias=bias), activation_dict[nl]]
+  linear = nn.Sequential(*blocks) if n_layers > 0 else None
+  return linear
+
+
+def str2list(attr_bins):
+  assert (isinstance(attr_bins, str))
+  attr_bins = attr_bins.strip()
+  if attr_bins.endswith(('.npy', '.npz')):
+    attr_bins = np.load(attr_bins)
+  else:
+    assert (attr_bins.startswith('[') and attr_bins.endswith(']'))
+    # attr_bins = np.array(ast.literal_eval(attr_bins))
+    attr_bins = ast.literal_eval(attr_bins)
+  return attr_bins
+
+
+# def flip_binary_label(y, rate=0):
+#   num_flip = max(1, int(y.numel()*rate))
+#   idx = np.random.choice(y.numel(), num_flip, replace=False)
+#   y_comp = 1 - y
+#   y[idx] = y_comp[idx]
+#   return y
+
+@torch.no_grad()
+def flip_labels(y, n_classes, rate=0):
+  if rate <= 0:
+    return y
+  num_flip = max(1, int(y.numel()*rate))
+  idx = np.random.choice(y.numel(), num_flip, replace=False)
+  y[idx] = y[idx].random_(0, n_classes)
+  return y
+
+# @torch.no_grad()
+# def balance_binary_labels(y, rate=0):
+#   n0 = torch.count_nonzero(y == 0)
+#   n1 = torch.count_nonzero(y == 1)
+#   if n0 > n1:
+#     # flip a portion of 0 to 1
+#     m = (n0 - n1)/2
+#     num_flip = max(1, int(m*rate))
+#     idx = np.random.choice((y==0).nonzero().view(-1).cpu().numpy(), num_flip, replace=False)
+#     y[idx] = 1
+#   else:
+#     # flip a portion of 1 to 0
+#     m = (n1 - n0)/2
+#     num_flip = max(1, int(m*rate))
+#     idx = np.random.choice((y==1).nonzero().view(-1).cpu().numpy(), num_flip, replace=False)
+#     y[idx] = 0
+#   return y
+
+import ot
+@torch.no_grad()
+def balance_labels(y, n_classes, rate=0, target=[]):
+  ns = np.histogram(y.cpu().numpy(), bins=range(n_classes+1))[0]
+  if not target:
+    nt = np.ones(n_classes) * y.numel() / n_classes
+  else:
+    if isinstance(target, list):
+      target = np.array(target)
+    nt = target / np.sum(target) * y.numel()
+  M = np.ones((n_classes, n_classes)) - np.eye(n_classes)
+  p = ot.emd(ns, nt, M)
+  num_flip = (p * M * rate).astype(np.int64)
+  i, j = num_flip.nonzero()
+  for i_, j_ in zip(i, j):
+    # flip i_ to j_
+    idx_valid = torch.nonzero(y == i_).view(-1).cpu().numpy()
+    idx = np.random.choice(idx_valid, num_flip[i_, j_], replace=False)
+    y[idx] = j_
+  return y
+
+@torch.no_grad()
+def truncate_labels(y, n_classes, rate=0, target=[]):
+  # Truncates to minimum number of samples, set a portion to zero
+  # Returns weight
+  ns = np.histogram(y.cpu().numpy(), bins=range(n_classes+1))[0]
+  if not target:
+    nt = np.ones(n_classes)
+  elif isinstance(target, list):
+    nt = np.array(target)
+  r = ns / nt
+  nt_new = nt * r.min()
+  weight = torch.ones_like(y)
+  for i_ in range(n_classes):
+    idx_valid = torch.nonzero(y == i_).view(-1)
+    num_flip = int((idx_valid.numel() - nt_new[i_]) * rate)
+    if num_flip > 0:
+      idx = np.random.choice(idx_valid.cpu().numpy(), num_flip, replace=False)
+      weight[idx] = 0.
+  return weight
